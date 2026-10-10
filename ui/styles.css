@@ -1,0 +1,349 @@
+/* ui/styles.css —— Tailwind v4 入口 + 主题令牌（可运行时切换）。
+ *
+ * 令牌写成 Tailwind 的 @theme 颜色，组件里就能用 bg-panel / text-muted / border-line 这类类名。
+ * Tailwind 4 的 @theme 会把变量写在 :root 上、工具类引用 var(--color-*)，所以
+ * **后面用 html[data-*] 覆盖同名变量就能整体换肤**（不需要重建 CSS，也不需要改组件）。
+ *
+ * 运行时可切换的维度（见 ui/state/theme.js 与 features/settings/ThemeSection.jsx）：
+ *   主题模式 data-theme = dark | light      强调色 data-accent = teal|blue|violet|amber|rose|green
+ *   背景     data-bg    = solid|aurora|grid|image（image 用 --app-bg-image 传 URL）
+ *   字体     --font-sans / --font-mono（用户可选）      字号 --base-size（根字号，rem 全部跟着缩放）
+ *
+ * source(none) + @source "./" —— 只扫描 ui/ 目录：Tailwind 4 默认会从当前工作目录自动找源文件，
+ * 那会把 public/app.js（上一次的构建产物）也扫进去，改一行源码却因"产物里恰好有类名"而漏样式。
+ */
+@import "tailwindcss" source(none);
+@source "./";
+
+@theme {
+  --color-bg: #0a0f11;
+  --color-panel: #0f1618;
+  --color-card: #131c1f;
+  --color-raise: #1a262a;
+  --color-line: #23322f;
+  --color-fg: #dbeae7;
+  --color-muted: #93a8a3;
+  --color-subtle: #5f7370;
+  --color-accent: #2dd4bf;
+  --color-accent-strong: #14b8a6;
+  --color-danger: #f87171;
+  --color-warn: #fbbf24;
+  --color-ok: #4ade80;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
+
+  --animate-shimmer: shimmer 1.4s ease-in-out infinite;
+}
+
+/* ────────────────────────── 主题：浅色 ──────────────────────────
+   浅色不是把深色"反过来"，而是各自按可读性调过：底色偏暖、层级靠亮度差而不是描边。 */
+html[data-theme='light'] {
+  --color-bg: #f6f7f5;
+  --color-panel: #ffffff;
+  --color-card: #ffffff;
+  --color-raise: #eef1ef;
+  --color-line: #dfe4e1;
+  --color-fg: #1c2523;
+  --color-muted: #55635f;
+  --color-subtle: #8b9995;
+  --color-danger: #dc2626;
+  --color-warn: #b45309;
+  --color-ok: #15803d;
+}
+
+/* ────────────────────────── 主题：强调色 ────────────────────────── */
+html[data-accent='teal'] {
+  --color-accent: #2dd4bf;
+  --color-accent-strong: #14b8a6;
+}
+html[data-accent='blue'] {
+  --color-accent: #60a5fa;
+  --color-accent-strong: #3b82f6;
+}
+html[data-accent='violet'] {
+  --color-accent: #a78bfa;
+  --color-accent-strong: #8b5cf6;
+}
+html[data-accent='amber'] {
+  --color-accent: #fbbf24;
+  --color-accent-strong: #f59e0b;
+}
+html[data-accent='rose'] {
+  --color-accent: #fb7185;
+  --color-accent-strong: #f43f5e;
+}
+html[data-accent='green'] {
+  --color-accent: #4ade80;
+  --color-accent-strong: #22c55e;
+}
+/* 浅色下强调色要压暗一档，否则白底上发飘 */
+html[data-theme='light'][data-accent='teal'] {
+  --color-accent: #0d9488;
+  --color-accent-strong: #0f766e;
+}
+html[data-theme='light'][data-accent='blue'] {
+  --color-accent: #2563eb;
+  --color-accent-strong: #1d4ed8;
+}
+html[data-theme='light'][data-accent='violet'] {
+  --color-accent: #7c3aed;
+  --color-accent-strong: #6d28d9;
+}
+html[data-theme='light'][data-accent='amber'] {
+  --color-accent: #b45309;
+  --color-accent-strong: #92400e;
+}
+html[data-theme='light'][data-accent='rose'] {
+  --color-accent: #e11d48;
+  --color-accent-strong: #be123c;
+}
+html[data-theme='light'][data-accent='green'] {
+  --color-accent: #16a34a;
+  --color-accent-strong: #15803d;
+}
+
+/* ────────────────────────── 字号 ──────────────────────────
+   根字号一改，rem 相关的间距/圆角/字号整体等比缩放 —— 这是"整体大小"最省事且不破坏布局的做法。 */
+html {
+  font-size: var(--base-size, 16px);
+}
+
+/* ────────────────────────── 背景 ────────────────────────── */
+.app-shell {
+  background-color: var(--color-bg);
+  background-image: var(--app-bg-image, none);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+  position: relative;
+}
+/* 图片背景压一层底色保证可读性（.app-shell 的子层自带不透明底，只有消息区会透出来） */
+html[data-bg='image'] .app-shell::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--color-bg);
+  opacity: var(--app-bg-dim, 0.86);
+  pointer-events: none;
+}
+html[data-bg='image'] .app-shell > * {
+  position: relative;
+  z-index: 1;
+}
+/* 极光：用"强调色铺满 + 径向遮罩"而不是把颜色写进渐变 ——
+   写进渐变的 color-mix(var(--color-accent)) 会在构建期被折叠成固定色，换强调色就不跟了。 */
+html[data-bg='aurora'] .app-shell::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: var(--color-accent);
+  opacity: 0.1;
+  -webkit-mask-image:
+    radial-gradient(1100px 560px at 12% -8%, #000 0%, transparent 70%),
+    radial-gradient(900px 480px at 88% 0%, #000 0%, transparent 72%);
+  mask-image:
+    radial-gradient(1100px 560px at 12% -8%, #000 0%, transparent 70%),
+    radial-gradient(900px 480px at 88% 0%, #000 0%, transparent 72%);
+}
+html[data-bg='aurora'] .app-shell > * {
+  position: relative;
+  z-index: 1;
+}
+/* 细网格：网格线颜色自己按主题给（不经过 Tailwind 的令牌，免得被折叠成"只认深色"） */
+:root {
+  --grid-color: rgba(35, 50, 47, 0.5);
+}
+html[data-theme='light'] {
+  --grid-color: rgba(200, 210, 206, 0.85);
+}
+html[data-bg='grid'] .app-shell {
+  background-image:
+    linear-gradient(var(--grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+  background-size: 28px 28px, 28px 28px;
+  background-attachment: fixed;
+}
+html[data-bg='image'] .app-shell {
+  background-image: none; /* 图片走 ::before 那一层（带压暗） */
+}
+
+/* ────────────────────────── 会话列宽 ──────────────────────────
+   消息区与输入框**共用这一个宽度**（各写一份就错开十几像素，旧项目踩过）。
+   改宽度只改这里。 */
+.chat-col {
+  width: 100%;
+  /* 默认不限宽（跟随窗口）；要收窄就到「设置 → 主题 → 会话列宽」里设 */
+  max-width: var(--chat-max, none);
+  margin-inline: auto;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* 细滚动条：深色底上默认滚动条太抢眼 */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 8px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 进行中的文字呼吸感（"正在执行…"这类活状态用，静止时不用动效） */
+@keyframes shimmer {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+.shimmer {
+  animation: var(--animate-shimmer);
+}
+
+/* ── Markdown 正文（lib/markdown.js 的产物用 .md 包着） ── */
+.md > * {
+  margin: 0.5rem 0;
+}
+.md > *:first-child {
+  margin-top: 0.25rem;
+}
+.md > *:last-child {
+  margin-bottom: 0.25rem;
+}
+.md p {
+  white-space: normal;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-weight: 600;
+  line-height: 1.35;
+  margin-top: 1rem;
+}
+.md h1 {
+  font-size: 1.25rem;
+}
+.md h2 {
+  font-size: 1.1rem;
+}
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 1rem;
+}
+.md ul,
+.md ol {
+  padding-left: 1.4rem;
+}
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li {
+  margin: 0.15rem 0;
+}
+.md a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+.md blockquote {
+  border-left: 3px solid var(--color-line);
+  padding-left: 0.7rem;
+  color: var(--color-muted);
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 1rem 0;
+}
+.md code.md-code {
+  background: var(--color-raise);
+  border: 1px solid var(--color-line);
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  word-break: break-all;
+}
+.md pre.md-pre {
+  background: var(--code-bg, #070b0c);
+  border: 1px solid var(--color-line);
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.8rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+html[data-theme='light'] .md pre.md-pre {
+  --code-bg: #f2f4f3;
+}
+.md pre.md-pre code {
+  font-family: inherit;
+  white-space: pre;
+}
+.md pre.md-pre code[data-lang]:not([data-lang=""]) {
+  /* 语言标签画在代码块右上角（不额外套一层 DOM）；position 给下面的 ::before 定位 */
+  position: relative;
+}
+.md pre.md-pre code[data-lang]:not([data-lang=""])::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0.35rem;
+  right: 0.5rem;
+  font-size: 0.68rem;
+  color: var(--color-subtle);
+}
+
+/* 正文里的图片（markdown 的 ![alt](url)）：不撑破列宽、不无限高 */
+.md .md-img {
+  display: block;
+  max-width: 100%;
+  max-height: 60dvh;
+  margin: 0.4rem 0;
+  border: 1px solid var(--color-line);
+  border-radius: 0.6rem;
+  object-fit: contain;
+}
+
+/* 手机：输入区字体 ≥16px 更不容易被 iOS 放大 */
+@media (max-width: 480px) {
+  textarea,
+  input,
+  select {
+    font-size: 16px;
+  }
+}
