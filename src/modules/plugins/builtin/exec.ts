@@ -143,6 +143,7 @@ async function runCommand(args: Record<string, unknown>, ctx: ToolRunCtx) {
   if (ctx.remaining(budgetKey) <= 0) {
     return {
       ok: false,
+      errorCode: 'BUDGET_EXHAUSTED' as const,
       text: ctx.prompt('loop.budget_exhausted', { plugin: 'exec', detail: `本次运行最多 ${ctx.param('max_calls')} 条命令` }),
     };
   }

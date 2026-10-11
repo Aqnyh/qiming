@@ -9,6 +9,9 @@
  *     这样"为什么占了这么多"能一眼看出来（工具表往往是意外的大头）；
  *   · 数字全部来自服务端真分词（见 src/agent/count.ts），前端不做任何估算。
  *
+ * **悬停展开的分解在手机上没有意义**（点不出 hover），所以手机（<md）由调用方
+ * 传 `className="max-md:hidden"` 把它整颗收进设置 —— 见 Header.jsx。
+ *
  * 没有数据时不渲染（还没跑过、或服务端没配上下文上限）。
  */
 import { useApp } from '../state/store.js';
@@ -24,7 +27,7 @@ function tone(percent) {
   return { ring: 'text-accent', text: 'text-muted', label: '充足' };
 }
 
-export default function ContextRing() {
+export default function ContextRing({ className = '' }) {
   const st = useApp();
   const usage = st.activeId ? st.usage[st.activeId] : null;
   if (!usage || !usage.limit) return null;
@@ -44,7 +47,7 @@ export default function ContextRing() {
 
   return (
     <div
-      className="group/ctx relative flex shrink-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-[11.5px] hover:bg-raise"
+      className={`group/ctx relative flex shrink-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-[11.5px] hover:bg-raise ${className}`}
       title={`上下文占用 ${percent}%（真分词计数，${usage.encoding}）`}
     >
       <svg viewBox="0 0 20 20" className={`size-4 shrink-0 ${t.ring}`} aria-hidden="true">

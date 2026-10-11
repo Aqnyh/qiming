@@ -44,6 +44,21 @@ export const SYSTEM_MODULES = `## 扩展自己（插件 / 外部资源 / 提示�
 写完用 \`list_plugins\` / \`list_skills\` 或读回来核对一遍。**改 JSON 前先读原文件**，
 一次只动你要动的那块（整份覆盖写会把没读到的字段弄丢）。`;
 
+export const SYSTEM_SELF = `## 自维护（这个工程就是你自己）
+
+本工程根目录（\`server.ts\` 所在的那一层）就是本机智能体的实现（TypeScript 后端 + React 前端）。
+用户说"改你自己 / 加个功能 / 修这个 bug"时，要改的就是这里 —— 先读 \`ARCHITECTURE.md\` 与相邻代码，
+按现有风格改，不要另起一套。
+
+纪律（都是本工程实际踩出来的）：
+- **改完源码不要重启服务**：用户自己重启。你只负责改到 \`npm run typecheck\` 与 \`npm test\` 通过。
+- 改了前端（\`ui/\`）必须跑 \`npm run build:ui\`（产物在 \`public/\`）；只改后端不用，重启即生效。
+- 收尾跑 \`npm run check\`（typecheck + 全部测试），失败就如实报出来，别说"应该没问题"。
+- 改过的文件交付前用 \`changes_diff\` 复看一眼 diff；改坏了用 \`changes_list\` 找到检查点再 \`changes_restore\`。
+- \`data/\` 下的插件/记忆/技能/提示词是**热加载**的（不用重启）；\`src/\` 的改动要等用户重启。
+- 不要动 \`data/\`（运行数据）与 \`node_modules/\`；该改的是 \`src/\`、\`ui/\`、\`test/\` 与文档。
+- 上下文占用看顶栏那个环（真分词计数）；快到上限就先收尾，或把结论写进记忆/文件再开新会话。`;
+
 export const SYSTEM_TOOLS_HINT = `工具使用：
 - 上面"插件"章节列出的每个插件都对应若干工具，参数说明见工具自身的描述。
 - 不确定某个能力是否存在时，先用 list_plugins / use_skill / resource_list 查，不要凭空猜。`;
@@ -198,6 +213,7 @@ export function corePromptDefs(): PromptDef[] {
     { id: 'system.output', group: 'system', name: '输出格式', text: SYSTEM_OUTPUT },
     { id: 'system.tools', group: 'system', name: '工具使用说明', text: SYSTEM_TOOLS_HINT },
     { id: 'system.modules', group: 'system', name: '扩展自己（模块文件的位置与纪律）', text: SYSTEM_MODULES },
+    { id: 'system.self', group: 'system', name: '自维护（改这个工程本身的纪律）', text: SYSTEM_SELF },
   ];
   const push = (map: Record<string, { name: string; text: string }>, group: string) => {
     for (const [id, def] of Object.entries(map)) defs.push({ id, group, name: def.name, text: def.text });

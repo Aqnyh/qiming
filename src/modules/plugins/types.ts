@@ -19,6 +19,31 @@ export type ParamDef = {
 export type ToolImage = { mime: string; data: string };
 
 /**
+ * 工具结果的**标准错误码**（界面按它分类、审计按它聚合，不靠中文文案正则猜）。
+ *
+ * 命名对齐 dsh 的做法，逐个都是本工程真实出现过的场景：
+ *  - `ABORTED_BEFORE_DISPATCH`：用户在工具**还没派发**时就掐断了（结果=没执行）。
+ *  - `TOOL_OUTCOME_UNKNOWN`：已派发但没等到结果（被掐断/超时/进程没了）——**不能**当成"没执行"。
+ *  - `BUDGET_EXHAUSTED`：插件额度用完（用户参数决定的预算）。
+ *  - `INVALID_ARGS`：参数不合法/缺必填（工具自己判的）。
+ *  - `NOT_FOUND`：目标不存在（文件/会话/记录）。
+ *  - `EXEC_FAILED`：执行了但失败（非零退出、抛异常）。
+ *  - `UPSTREAM`：上游/依赖服务错误。
+ *  - `UNKNOWN_TOOL`：模型调了一个不存在或未启用的工具。
+ *  - `LOOP_GUARD`：循环守卫拦下的（重复空转、连续截断…）。
+ */
+export type ToolErrorCode =
+  | 'ABORTED_BEFORE_DISPATCH'
+  | 'TOOL_OUTCOME_UNKNOWN'
+  | 'BUDGET_EXHAUSTED'
+  | 'INVALID_ARGS'
+  | 'NOT_FOUND'
+  | 'EXEC_FAILED'
+  | 'UPSTREAM'
+  | 'UNKNOWN_TOOL'
+  | 'LOOP_GUARD';
+
+/**
  * 要给**用户看**的媒体（与 ToolImage 方向相反：ToolImage 是给模型看的，ToolMedia 是给人看的）。
  * 两种来源：`url`（外部链接，前端直接加载）或 `download`（待下载目录里的文件名，
  * 前端用 fileUrl() 补上登录令牌再渲染 —— 令牌只在浏览器里，服务端拼不出可用的 URL）。
@@ -34,6 +59,11 @@ export type ToolResult = {
   ok: boolean;
   /** 回灌给模型的内容（可以是长文；落盘时全文进 run journal） */
   text: string;
+  /**
+   * 结构化错误码：给界面**分类**用（不再靠中文文案正则猜）。
+   * 借鉴 dsh 对"未派发/未应答调用"的统一补码。只有 ok=false 才有意义。
+   */
+  errorCode?: ToolErrorCode;
   /** 折叠时显示的一行摘要（默认从 text 首行截断） */
   note?: string;
   /** 文件改动行数（界面显示 +N/−M） */
@@ -45,6 +75,12 @@ export type ToolResult = {
   media?: ToolMedia[];
   /** 提示词需要重算（记忆/技能/插件被改动后） */
   refreshPrompt?: boolean;
+  /**
+   * 超大结果被落盘（spill）时的记录：完整正文在 `path`，回灌给模型的是头尾预览。
+   * 界面据此显示"全文已落盘，点开看/复制路径"，模型也能 read_file 取细节。
+   * 未落盘就没有这个字段（结果本来就短，直接内联）。
+   */
+  spill?: { path: string; chars: number };
 };
 
 export type ToolRunCtx = {
@@ -66,7 +102,17 @@ export type ToolRunCtx = {
   /** 用户登录后保存的本机密码（执行 sudo 用）；没登录就是空 */
   sudoPassword: () => string;
   /** 子智能体：由运行宿主注入（避免模块循环依赖） */
-  runSubagent?: (task: string, opts: { tools?: string[]; readOnly?: boolean; maxRounds?: number }) => Promise<{ ok: boolean; text: string; runId: string }>;
+  runSubagent?: (task: string, opts: { tools?: string[]; readOnly?: boolean; maxRounds?: number }) => Promise<{ ok: boolean; text: string; runId: string; id?: string }>;
+  /**
+   * 子智能体的**控制面**（由运行宿主注入）：列表 / 续谈 / 中断。
+   * 让子智能体不是"一次性把结论带回来就消失"，而是可以被父体继续追问、被中断、被列举
+   * （对照 dsh 的 subagent 家族：continuable / message / interrupt / list）。
+   */
+  subagents?: {
+    list: () => Array<{ id: string; task: string; status: string; parentRunId?: string; createdAt: number; runs: number; finalText?: string }>;
+    send: (id: string, text: string) => Promise<{ ok: boolean; text: string; runId: string; id: string }>;
+    stop: (id: string) => boolean;
+  };
   /**
    * 文件改动的"比对与撤回"（影子 git 仓库，见 store/checkpoints.ts）。
    * 写文件的工具在**动手前**调 `snapshot` 记一笔；`changes` 插件用它列改动/看 diff/撤回。
@@ -76,6 +122,11 @@ export type ToolRunCtx = {
     snapshot: (label: string, files: string[]) => Promise<{ id: string; label: string } | null>;
     list: () => Promise<Array<{ id: string; ts: number; label: string; files: string[]; added?: number; removed?: number }>>;
     diff: (id?: string) => Promise<{
+      text: string;
+      stat: { files: number; added: number; removed: number; list: Array<{ path: string; added: number; removed: number }> };
+    }>;
+    /** 某个检查点之后改了什么（与下一个检查点比；最新的那条与当前工作树比） */
+    show: (id: string, file?: string) => Promise<{
       text: string;
       stat: { files: number; added: number; removed: number; list: Array<{ path: string; added: number; removed: number }> };
     }>;

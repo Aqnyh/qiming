@@ -18,6 +18,7 @@ import { thinkSplitter } from '../src/providers/think.ts';
 import { textCallSplitter } from '../src/providers/textcalls.ts';
 import { buildBody as openaiBuildBody } from '../src/providers/openai.ts';
 import { buildBody as anthropicBuildBody } from '../src/providers/anthropic.ts';
+import { repairHistory } from '../src/agent/loop.ts';
 import {
   chat, listModels, errorText, joinUrl, mergeRequestHeaders, sessionHeaderFor, sessionValue,
 } from '../src/providers/index.ts';
@@ -646,6 +647,12 @@ describe('index.ts', () => {
     assert.match(errorText(429, 'rate limited'), /^HTTP 429：请求过于频繁或额度用尽（稍后重试）｜rate limited/);
     assert.match(errorText(529, 'overloaded'), /^HTTP 529：模型服务端错误（可稍后重试）｜overloaded/);
     assert.equal(errorText(418, 'teapot'), 'HTTP 418｜teapot');
+    // 上游 400 正文只有模型名 = 消息序列畸形的伪装（2026-10-10 实战：极易被误读成"模型名不对"）
+    const masked = errorText(400, '{"model":"deepseek-v4.1-flash"}');
+    assert.match(masked, /^HTTP 400｜/);
+    assert.match(masked, /消息序列畸形/);
+    // 但正常带 message 的 400 不该被加这句（别把无关错误也归到序列上）
+    assert.equal(/消息序列畸形/.test(errorText(400, '{"error":{"message":"bad param"}}')), false);
     const long = errorText(500, 'x'.repeat(2000));
     assert.equal(long.length < 700, true);               // 正文片段有上限
   });
@@ -673,4 +680,90 @@ describe('index.ts', () => {
     assert.equal(joinUrl('http://127.0.0.1:8080/v1?api-version=2024', '/chat/completions'), 'http://127.0.0.1:8080/v1/chat/completions?api-version=2024');
     assert.throws(() => joinUrl('file:///tmp/x', '/chat'), /http/);
   });
+
+  /* repairHistory：请求前的历史自愈。
+     这两组用例就是 2026-10-10 那次「运行被 400 终结」的真实畸形形态——
+     对着真实网关复现过：畸形发出去 = HTTP 400 {"model":"…"}，修好后 = 200。 */
+  it('repairHistory：打断分支的重复 assistant（同 id tool_calls）应被去重且配对自洽', () => {
+    const call = { id: 'call_46', name: 'run_command', args: { command: 'ls' } };
+    const a = { role: 'assistant', content: '', toolCalls: [call] };
+    const h = [
+      { role: 'user', content: '帮我看看账号资料' },
+      a, a, // ← 打断分支重复 push 的产物（旧 loop.ts 的 bug）
+      { role: 'tool', toolCallId: 'call_46', content: '（用户打断，这次调用没有执行。）' },
+      { role: 'user', content: '使用屏幕操作和 use browser 结合来找到正确的 DOM' },
+    ];
+    const n = repairHistory(h);
+    assert.ok(n > 0, '应当报告修正了若干处');
+    // 硬约束：同 id 的 tool_call 全历史只能出现一次，且必有配对——这正是网关 400 的判据
+    assertToolCallsPaired(h);
+    assert.equal(h.filter((m) => m.toolCalls?.length).length, 1, '只应剩一条带 tool_calls 的 assistant');
+    // 第二条（正文与调用都为空的重复件）应当被删掉，不留垃圾
+    assert.ok(h.every((m) => m.role !== 'assistant' || m.content.trim() || m.toolCalls?.length));
+  });
+
+  it('repairHistory：截断分支缺 tool 结果应补齐，孤儿 tool / 空 assistant 应删除', () => {
+    const h = [
+      { role: 'user', content: '开始' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call_7', name: 'write_file', args: {} }] },
+      { role: 'user', content: '（上一轮输出被截断，请拆小重来）' }, // ← 中间没有 tool 结果
+      { role: 'tool', toolCallId: 'call_orphan', content: '孤儿结果' }, // ← 没有对应调用
+      { role: 'assistant', content: '' }, // ← 空 assistant，发出去必 400
+      { role: 'user', content: '结尾' },
+    ];
+    const n = repairHistory(h);
+    assert.ok(n >= 3, `应当修正多处（实际 ${n}）`);
+    assert.ok(!h.some((m) => m.role === 'tool' && m.toolCallId === 'call_orphan'), '孤儿 tool 结果要删掉');
+    assert.ok(!h.some((m) => m.role === 'assistant' && !m.content.trim() && !m.toolCalls?.length), '空 assistant 要删掉');
+    assertToolCallsPaired(h);
+  });
+
+  it('repairHistory：干净的历史一个字都不动（幂等）', () => {
+    const h = [
+      { role: 'user', content: '读一下' },
+      { role: 'assistant', content: '好', toolCalls: [{ id: 'c1', name: 'read_file', args: { path: '/tmp/a' } }] },
+      { role: 'tool', toolCallId: 'c1', content: '内容' },
+      { role: 'assistant', content: '看完了' },
+      { role: 'user', content: '下一件事' },
+    ];
+    const snapshot = JSON.stringify(h);
+    assert.equal(repairHistory(h), 0);
+    assert.equal(JSON.stringify(h), snapshot);
+    assert.equal(repairHistory(h), 0, '再跑一次仍为 0（幂等）');
+  });
+
+  it('repairHistory：不碰「连续两条 user / 两条 assistant」——实测这两种形态上游收，且循环靠它识别重试场景', () => {
+    const h = [
+      { role: 'user', content: '故障:429 问一句' },
+      { role: 'user', content: '（上游出错，自动重试第 1 次）' }, // 循环注入的重试提示
+      { role: 'assistant', content: '第一段' },
+      { role: 'assistant', content: '第二段' },
+    ];
+    const snapshot = JSON.stringify(h);
+    assert.equal(repairHistory(h), 0, '这些都不是畸形，不该动');
+    assert.equal(JSON.stringify(h), snapshot);
+  });
 });
+
+/** 断言：历史里每条 assistant 的 toolCalls 都在紧随其后的 tool 消息里找得到配对，且没有孤儿 tool */
+function assertToolCallsPaired(h) {
+  const ids = new Set();
+  for (let i = 0; i < h.length; i++) {
+    const m = h[i];
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      const need = new Set(m.toolCalls.map((c) => c.id));
+      assert.equal(need.size, m.toolCalls.length, `同一条 assistant 里 tool_call id 不能重复：${[...need]}`);
+      let j = i + 1;
+      while (j < h.length && h[j].role === 'tool') {
+        need.delete(h[j].toolCallId);
+        j += 1;
+      }
+      assert.equal(need.size, 0, `这些调用缺少 tool 结果：${[...need]}`);
+      for (const c of m.toolCalls) {
+        assert.ok(!ids.has(c.id), `tool_call id 跨消息重复：${c.id}`);
+        ids.add(c.id);
+      }
+    }
+    if (m.role === 'tool') assert.ok(ids.has(m.toolCallId), `孤儿 tool 结果：${m.toolCallId}`);
+  }
+}

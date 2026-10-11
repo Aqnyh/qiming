@@ -38,12 +38,29 @@ export const state = {
    * 顶栏的上下文环读它；刷新后由 GET /api/session/:id 的 usage 补上（不然环会一直等下一次事件）。
    */
   usage: {},
+  /**
+   * sessionId -> 文件改动清单（检查点，新→旧）。
+   * 右列「文件改动」面板读它；刷新后由 GET /api/session/:id 的 changes 补上，
+   * 运行中靠 SSE 的 checkpoint 事件增量刷新。
+   */
+  changes: {},
+  /**
+   * sessionId -> 压缩替换节点（声明式：每个记「被哪段 [from,to) 替换成了什么摘要」）。
+   * 让"上下文里哪些历史被摘要替掉了"可见，且删掉节点即撤回（见 agent/context.ts）。
+   */
+  compact: {},
+  /**
+   * 「文件改动」大抽屉是否打开。
+   * 不开着时右列只留一条入口条（右列 256px 太窄，diff 放不下 —— 见 ChangesPanel.jsx）。
+   */
+  changesOpen: false,
   streams: {}, // sessionId -> 流式缓冲 { runId, msgId, content, thinkingChars, thinkingTail, calls, notices, stats, steers, ended }
   todo: null, // 右上角任务清单（GET /api/todo）
   todoOpen: true,
 
   drawer: { open: false, section: 'plugins' }, // 设置抽屉
   downloads: false, // 「待下载」对话框
+  auditOpen: false, // 「会话事件日志」查看器（可追溯/可审计）
   sidebarOpen: false, // 窄屏侧栏抽屉
   toast: null, // 一条全局提示（错误/成功）
   staleServer: null,

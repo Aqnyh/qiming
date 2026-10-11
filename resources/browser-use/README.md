@@ -9,8 +9,8 @@
 bash resources/browser-use/install.sh
 ```
 
-它会建一个独立 venv（`./.venv`）并装 `browser-use`。本机已有 `/usr/bin/google-chrome`，
-所以**不依赖** playwright 下载的 Chromium（装不上也不影响）。
+它会建一个独立 venv（`./.venv`）并装 `browser-use`。若系统里已装 Chrome/Chromium，
+会优先用它，**不依赖** playwright 另外下载的 Chromium（下载失败也不影响用系统浏览器）。
 
 ## 接哪个模型
 
@@ -21,21 +21,30 @@ browser-use 自己也是一个 agent，需要一个"会用工具"的模型。四
 3. **启明自己的服务商设置**（`data/settings.json` 里当前那条）—— 所以界面里配过模型，这里就能直接跑
 4. 环境变量 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `BROWSER_USE_MODEL`
 
-`config.json` 的全部字段（都有默认值，可以不写）：
+`config.json` 的全部字段（都有默认值，可以不写）。
+仓库里给的是 `config.example.json`，复制一份改名即用（`config.json` 被 `.gitignore` 忽略，
+是"每台机器自己的"配置）：
+
+```bash
+cp resources/browser-use/config.example.json resources/browser-use/config.json
+```
 
 ```json
 {
   "headless": true,                 // 无头；调试时设 false 能看着它操作
   "max_steps": 50,
   "timeout": 600,                   // 整个任务的墙钟上限（秒）
-  "extensions": true,               // 预置扩展（uBlock 等）——**需要代理**才下得动
-  "proxy": "http://127.0.0.1:7890", // 本机代理：Python 侧下载与 Chrome 自身流量都走它
+  "extensions": true,               // 预置扩展（uBlock 等）—— 需要能访问 Chrome 商店
   "max_completion_tokens": 8192,    // 每步 4096 偏小（实测会被截断）
   "loose_structured_output": true,  // 网关不支持 json_schema 时把 schema 写进系统提示词
   "chrome_args": [],                // 追加的 Chrome 参数
-  "default_headers": {}             // 追加的请求头
+  "default_headers": {},            // 追加的请求头
+  "proxy": ""                       // 需要科学上网时填，如 "http://127.0.0.1:7890"；不需要就留空
 }
 ```
+
+> `proxy` 会把环境变量（Python 侧下载）与 `--proxy-server`（Chrome 自身流量）一起设上。
+> 只有在你确实需要走代理访问外网时才填；留空则直连。
 
 ### 三个实测踩过的坑（都已在代码里处理）
 

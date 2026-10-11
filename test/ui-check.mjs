@@ -127,12 +127,30 @@ server.stderr.on('data', (c) => logs.push(String(c)));
 for (let i = 0; i < 80 && !logs.join('').includes('启明已启动'); i++) await sleep(150);
 
 /* 慢流假上游：排队条只在"运行中"出现，所以需要一个能跑一会儿的运行。
-   60s 的窗口 —— 检查脚本的步骤多，窗口太短会偶发。 */
+   60s 的窗口 —— 检查脚本的步骤多，窗口太短会偶发。
+   另外支持一个"用工具写文件"的标记：那一路会先发一个 write_file 调用（用来造出
+   真实的文件改动检查点，供「文件改动」抽屉的检查用），再给最终回答。 */
 upstream = http.createServer((req, res) => {
   let raw = '';
   req.on('data', (c) => (raw += c));
   req.on('end', () => {
+    const body = JSON.parse(raw || '{}');
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    const last = msgs.at(-1);
+    const wantTool = String(last?.content ?? '').includes('用工具写文件') && !msgs.some((m) => m.role === 'tool');
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (wantTool) {
+      const chunk = (delta, finish = null) =>
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
+      chunk({ tool_calls: [{ index: 0, id: 'call_ui1', type: 'function', function: { name: 'write_file', arguments: '{"path":"out/ui-note.txt","content":"界面检查用的文件\\n"}' } }] });
+      chunk({}, 'tool_calls');
+      return res.end('data: [DONE]\n\n');
+    }
+    if (msgs.some((m) => m.role === 'tool')) {
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '已写好文件。' }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      return res.end('data: [DONE]\n\n');
+    }
     let i = 0;
     const timer = setInterval(() => {
       if (res.writableEnded || res.destroyed) return clearInterval(timer);
@@ -351,6 +369,195 @@ ok(S.msgScrollable, '消息区确实有滚动条（内容比容器长）');
 ok(!S.navScrollable || S.navMoved > 0, '会话区有滚动条且能自己滚');
 ok(!S.todoScrollable || S.todoMoved > 0, '待办清单有滚动条且能自己滚');
 
+console.log('\n【文件改动面板】');
+/* 需求：改过哪些文件要能在界面上看到（列表 + diff + 撤回），
+   数据来自影子 git 检查点（src/store/checkpoints.ts）。
+   现在右列只留一条入口，点开是**右侧大抽屉**（右列 256px 放不下行号与并排视图）。
+   这里只管"入口 → 抽屉 → 结构"；diff 的数据正确性由 e2e 的
+   「文件改动：结构化 diff」用例守着（真改文件、真取 diff）。 */
+{
+  const P = JSON.parse(await cdp.evaluate(`(() => {
+    const entry = document.querySelector('[aria-label="文件改动"]');
+    const right = document.querySelector('[aria-label="右列"]');
+    const drawer = document.querySelector('[role="dialog"][aria-label="文件改动"]');
+    return JSON.stringify({
+      hasEntry: Boolean(entry),
+      inRightCol: Boolean(right && entry && right.contains(entry)),
+      hasTodo: Boolean(document.querySelector('[aria-label="待办清单"]')),
+      entryText: entry ? entry.innerText.replace(/\\s+/g, ' ').slice(0, 40) : '',
+      drawerOpen: Boolean(drawer),
+    });
+  })()`));
+  ok(P.hasEntry, '右列有「文件改动」入口');
+  ok(P.inRightCol, '入口挂在右列（与待办同列，不盖住消息）');
+  ok(P.hasTodo, '待办面板还在（两者共存）');
+  ok(/文件改动/.test(P.entryText), `入口标题正确（实际：${P.entryText}）`);
+  ok(!P.drawerOpen, '默认不展开大抽屉（点开才显示）');
+
+  // 点开入口 → 抽屉出现（占大半屏）
+  await cdp.evaluate(`(() => { document.querySelector('[aria-label="文件改动"]').click(); return true; })()`);
+  await sleep(1000);
+  const D = JSON.parse(await cdp.evaluate(`(() => {
+    const d = document.querySelector('[role="dialog"][aria-label="文件改动"]');
+    if (!d) return JSON.stringify({ open: false });
+    const r = d.getBoundingClientRect();
+    return JSON.stringify({
+      open: true,
+      wide: Math.round(r.width),
+      vw: window.innerWidth,
+      inRight: r.left > 0,
+      text: d.innerText.replace(/\\s+/g, ' ').slice(0, 80),
+    });
+  })()`));
+  ok(D.open, '点击入口打开大抽屉');
+  ok(D.wide / D.vw > 0.6, `抽屉够宽（${D.wide}/${D.vw}，要占大半屏才放得下 diff）`);
+  ok(D.inRight, '抽屉靠右（与设置抽屉同一侧）');
+  ok(/检查点/.test(D.text ?? ''), `抽屉里是检查点视图（实际：${(D.text ?? '').slice(0, 40)}）`);
+
+  // Esc 关闭
+  await cdp.evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()`);
+  await sleep(600);
+  const closed = await cdp.evaluate(`!document.querySelector('[role="dialog"][aria-label="文件改动"]')`);
+  ok(closed, 'Esc 能关掉抽屉');
+}
+
+console.log('\n【文件改动：真实 diff 渲染】');
+/* 上面只验了空状态。这里让假上游真的写一次文件（走 write_file 工具），
+   再看抽屉里是不是**真的画出了 diff**：行号双列、增删底色、视图切换、折叠条。
+   空抽屉看着永远"对"，diff 的坑全在有数据的时候（行号、折叠、并排配对）。 */
+{
+  const sid = (await api('POST', '/api/sessions', { projectId })).json.session.id;
+  /* 假上游写的是项目根目录下的 out/ui-note.txt，而项目根就是本工程 ——
+     上一轮检查留下的同名文件必须清掉，否则"再写一遍同样的内容"**没有差异**，
+     抽屉当然是空的（这个坑踩过一次：看着像界面没渲染，其实是 diff 真的为空）。 */
+  const notePath = path.join(ROOT, 'out', 'ui-note.txt');
+  try { fs.rmSync(notePath, { force: true }); } catch { /* 忽略 */ }
+  await api('POST', '/api/chat', { sessionId: sid, text: '用工具写文件' });
+  // 等运行收尾（假上游写完文件后给最终回答）
+  for (let i = 0; i < 60; i++) {
+    const s = await api('GET', `/api/session/${sid}`);
+    const last = s.json.session.msgs.at(-1);
+    if (last?.role === 'assistant' && last.stats) break;
+    await sleep(250);
+  }
+  const changes = (await api('GET', `/api/session/${sid}`)).json.changes ?? [];
+  ok(changes.length > 0, `写文件后产生检查点（实际 ${changes.length} 条）`);
+  // 接口层先确认真的能算出 diff（否则前端没东西可画，问题不在界面）
+  let apiFiles = 0;
+  for (const cp of changes) {
+    const d = await api('GET', `/api/changes/diff?sessionId=${sid}&checkpoint=${cp.id}`);
+    apiFiles += (d.json.files ?? []).length;
+  }
+  ok(apiFiles > 0, `接口能算出文件差异（实际 ${apiFiles} 个文件）`);
+
+  /* 这条会话是页面加载之后才建的，侧栏里还没有它 —— 刷新一次让列表重新拉，
+     再点开它（沿用上面那句"点会话行"的写法：行是 cursor-pointer 的 div）。 */
+  await cdp.send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
+  await sleep(5200);
+  const title = (await api('GET', `/api/session/${sid}`)).json.session.title ?? '';
+  const clicked = await cdp.evaluate(`(() => {
+    const row = [...document.querySelectorAll('[data-region="sessions"] div')]
+      .find((r) => r.className.includes('cursor-pointer') && r.textContent.includes(${JSON.stringify(title)}));
+    row?.click();
+    return Boolean(row);
+  })()`);
+  ok(clicked, `能在侧栏点开刚改过文件的会话（标题：${title}）`);
+  await sleep(1500);
+  await cdp.evaluate(`(() => { document.querySelector('[aria-label="文件改动"]')?.click(); return true; })()`);
+  await sleep(1500);
+
+  const R = JSON.parse(await cdp.evaluate(`(() => {
+    const d = document.querySelector('[role="dialog"][aria-label="文件改动"]');
+    if (!d) return JSON.stringify({ open: false });
+    const text = d.innerText.replace(/\\s+/g, ' ');
+    // 行号：等宽小字、tabular-nums 的那批（Gutter 组件）
+    const gutters = [...d.querySelectorAll('.tabular-nums')].map((n) => (n.textContent || '').trim()).filter((t) => /^\\d+$/.test(t));
+    // 增删行：底色类（bg-ok/10 与 bg-danger/10）
+    const adds = [...d.querySelectorAll('.text-ok')].length;
+    const dels = [...d.querySelectorAll('.text-danger')].length;
+    // 并排/统一切换按钮
+    const views = [...d.querySelectorAll('button')].map((b) => b.innerText.trim());
+    return JSON.stringify({
+      open: true,
+      hasPath: /out\\/ui-note\\.txt/.test(text),
+      hasPlus: /\\+1/.test(text),
+      gutters,
+      adds, dels,
+      hasUnified: views.includes('统一'),
+      hasSplit: views.includes('并排'),
+      hasStat: /个文件/.test(text),
+    });
+  })()`));
+  ok(R.open, '抽屉能打开');
+  ok(R.hasPath, '画出了改动的文件路径（out/ui-note.txt）');
+  ok(R.gutters.length > 0, `渲染了行号（实际 ${R.gutters.length} 个数字行号）`);
+  ok(R.gutters.includes('1'), `新增行的行号从 1 起（实际 ${JSON.stringify(R.gutters.slice(0, 6))}）`);
+  ok(R.adds > 0, '新增行有增色（text-ok）');
+  ok(R.hasUnified && R.hasSplit, '统一 / 并排两个视图都在');
+  ok(R.hasStat, '顶部有"N 个文件"的统计');
+
+  /* 切到并排视图：左右两栏都出现（并排是这次新加的渲染路径）。
+     先挂个全局错误钩子 —— 渲染期抛异常时 React 会把整棵子树卸载（抽屉直接消失），
+     只看"元素不见了"根本不知道为什么，必须把报错捞出来。 */
+  await cdp.evaluate(`(() => {
+    window.__errs = [];
+    window.addEventListener('error', (e) => window.__errs.push(String(e.message || e.error || e)));
+    return true;
+  })()`);
+  await cdp.evaluate(`(() => {
+    const d = document.querySelector('[role="dialog"][aria-label="文件改动"]');
+    const b = [...d.querySelectorAll('button')].find((x) => x.innerText.trim() === '并排');
+    b?.click();
+    return true;
+  })()`);
+  await sleep(500);
+  const S = JSON.parse(await cdp.evaluate(`(() => {
+    try {
+      const d = document.querySelector('[role="dialog"][aria-label="文件改动"]');
+      if (!d) return JSON.stringify({ halves: 0, stillHasPath: false, note: '抽屉不见了' });
+      // 并排视图里每一行是"左右各 50%"的两栏
+      const halves = [...d.querySelectorAll('div')].filter((n) => String(n.getAttribute('class') || '').includes('w-[50%]'));
+      return JSON.stringify({ halves: halves.length, stillHasPath: /out\\/ui-note\\.txt/.test(d.innerText) });
+    } catch (e) {
+      return JSON.stringify({ halves: 0, stillHasPath: false, note: String(e) });
+    }
+  })()`));
+  if (!S.halves) {
+    const errs = await cdp.evaluate(`JSON.stringify(window.__errs ?? [])`);
+    const body = await cdp.evaluate(`document.body.innerText.replace(/\\s+/g,' ').slice(0, 120)`);
+    console.log(`    ↳ 页面报错：${errs}`);
+    console.log(`    ↳ 当前正文：${body}`);
+  }
+  ok(S.halves >= 2, `并排视图渲染成左右两栏（实际 ${S.halves} 个半栏）`, S.note ?? '');
+  ok(S.stillHasPath, '切换视图后文件头还在');
+
+  await cdp.evaluate(`(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()`);
+  await sleep(400);
+
+  /* 把界面还原成"开着长会话"：后面的排队条用例默认界面就在 s1 上，
+     这一段刷新过页面又切走了会话，不还原会让后面全挂（踩过）。 */
+  await cdp.send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
+  await sleep(5200);
+  await cdp.evaluate(`(() => {
+    const row = [...document.querySelectorAll('[data-region="sessions"] div')]
+      .find((r) => r.className.includes('cursor-pointer') && r.textContent.includes('长会话'));
+    row?.click();
+    return Boolean(row);
+  })()`);
+  await sleep(1500);
+}
+
+console.log('\n【上下文环】');
+/* 需求：上下文占用常驻顶栏、真分词计数、悬停给分解 */
+{
+  const C = JSON.parse(await cdp.evaluate(`(() => {
+    const el = [...document.querySelectorAll('header *')].find((n) => /上下文占用/.test(n.getAttribute('title') || ''));
+    return JSON.stringify({ has: Boolean(el), title: el?.getAttribute('title') || '' });
+  })()`));
+  ok(C.has, '顶栏有上下文占用环（真分词计数）');
+  ok(/真分词计数/.test(C.title), `环的说明写明计数口径（实际：${C.title.slice(0, 40)}）`);
+}
+
 console.log('\n【附件顺序】');
 // 需求：图片/视频要按模型发出的顺序插在正文里，而不是一律堆在末尾
 const ordered = await cdp.evaluate(`(() => {
@@ -387,19 +594,21 @@ console.log('\n【排队条（运行中发消息 = 先排队，不进消息区�
   await cdp.evaluate(`(() => { const ta = document.querySelector('textarea'); ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); return true; })()`);
   await sleep(1200);
 
-  const strip = await cdp.evaluate(`(() => {
-    const text = document.body.innerText.replace(/\s+/g, ' ');
-    const hasStrip = /排队 1 条/.test(text);
+  const strip = await cdp.evaluate(`(() => { try {
+    const text = document.body.innerText.replace(/\\s+/g, ' ');
+    const hasStrip = /队列 1 条/.test(text);
     const inMessages = document.querySelector('[data-region="messages"]').innerText.includes('排队的一句补充');
     const hasExecute = [...document.querySelectorAll('button')].some((b) => b.textContent.includes('立即执行'));
     const hasDelete = [...document.querySelectorAll('button')].some((b) => (b.title || '').includes('从队列里删掉'));
-    return JSON.stringify({ hasStrip, inMessages, hasExecute, hasDelete });
-  })()`);
+    const mode = [...document.querySelectorAll('span')].some((s) => s.textContent === '排队');
+    return JSON.stringify({ hasStrip, inMessages, hasExecute, hasDelete, mode });
+  } catch (e) { return JSON.stringify({ error: String(e) }); } })()`);
   const S = JSON.parse(strip);
-  ok(S.hasStrip, '输入框上方出现「排队 1 条」');
+  ok(S.hasStrip, '输入框上方出现「队列 1 条」');
   ok(!S.inMessages, '**排队中的消息不出现在消息区**（没执行就不显示）');
-  ok(S.hasExecute, '排队条里有「立即执行」按钮');
-  ok(S.hasDelete, '排队条里有删除按钮');
+  ok(S.hasExecute, '队列条里有「立即执行」按钮');
+  ok(S.hasDelete, '队列条里有删除按钮');
+  ok(S.mode, 'Enter 默认语义是「排队」（这一段跑完自动执行）');
 
   // 点删除 → 排队条消失（且服务端队列也空）
   const del = await cdp.evaluate(`(() => {
@@ -410,8 +619,8 @@ console.log('\n【排队条（运行中发消息 = 先排队，不进消息区�
   })()`);
   await sleep(1000);
   const after = await cdp.evaluate(`(() => {
-    const text = document.body.innerText.replace(/\s+/g, ' ');
-    return JSON.stringify({ stillThere: /排队 1 条/.test(text) });
+    const text = document.body.innerText.replace(/\\s+/g, ' ');
+    return JSON.stringify({ stillThere: /队列 1 条/.test(text) });
   })()`);
   ok(del && !JSON.parse(after).stillThere, '点删除后排队条消失');
   const q = await api('GET', `/api/run/queue?sessionId=${chat.json.sessionId}`);
@@ -421,7 +630,7 @@ console.log('\n【排队条（运行中发消息 = 先排队，不进消息区�
   const fromElsewhere = await api('POST', '/api/chat', { sessionId: chat.json.sessionId, text: '别的设备排的队' });
   ok(fromElsewhere.json.steered === true, '经接口入队成功');
   await sleep(1200);
-  const seen = await cdp.evaluate(`document.body.innerText.includes('别的设备排的队') && /排队 1 条/.test(document.body.innerText.replace(/\\s+/g, ' '))`);
+  const seen = await cdp.evaluate(`document.body.innerText.includes('别的设备排的队') && /队列 1 条/.test(document.body.innerText.replace(/\\s+/g, ' '))`);
   ok(seen, '别的设备排的队也会出现在排队条里（不是只有自己发的才显示）');
   await api('POST', '/api/run/queue', { sessionId: chat.json.sessionId, id: fromElsewhere.json.item.id, action: 'remove' });
 
@@ -529,6 +738,197 @@ console.log('\n【归档整个项目（用户报过的 bug：归档后侧栏变�
       ok(!reloaded.includes('长会话'), '刷新后一致（不再出现"归档后与刷新后不一样"）');
     }
   }
+}
+
+/* ────────────────────────── 设置：模型 vs 系统 两页 ────────────────────────── */
+
+console.log('\n【设置：模型 / 系统 两页（参数归属归一，且都在界面上可改）】');
+{
+  await cdp.send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
+  await sleep(5000);
+
+  // 打开设置抽屉，切到「系统」
+  await cdp.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === '设置');
+    if (b) b.click();
+    return true;
+  })()`);
+  await sleep(800);
+  const sys = await cdp.evaluate(`(async () => {
+    const btn = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === '系统');
+    if (!btn) return JSON.stringify({ error: '没有「系统」板块入口' });
+    btn.click();
+    await new Promise((r) => setTimeout(r, 1200));
+    const text = document.body.innerText.replace(/\\s+/g, ' ');
+    const inputs = [...document.querySelectorAll('input[type="number"]')].length;
+    const has = (s) => text.includes(s);
+    return JSON.stringify({
+      inputs,
+      hasMaxRounds: has('maxRounds'),
+      hasMaxRuns: has('maxRuns'),
+      hasSpill: has('spillMaxChars'),
+      hasCheckpoint: has('checkpointLimit'),
+      hasQueueDefault: has('queueDefault') || has('默认语义'),
+    });
+  })()`);
+  const Y = JSON.parse(sys);
+  ok(!Y.error, `「系统」板块能打开（${Y.error ?? 'ok'}）`);
+  if (!Y.error) {
+    ok(Y.inputs >= 6, `系统参数以可编辑输入框呈现（${Y.inputs} 个数字输入框）`);
+    ok(Y.hasMaxRounds && Y.hasMaxRuns, '轮次上限 / 并发上限在系统页可见可改');
+    ok(Y.hasSpill, '超长结果落盘阈值在系统页可见可改');
+    ok(Y.hasCheckpoint, '检查点列表条数（此前硬编码 200）在系统页可见可改');
+    ok(Y.hasQueueDefault, '运行中发消息的默认语义在系统页可见可改');
+  }
+
+  // 切到「模型」：应当**只**有模型调用参数，不再混着系统参数
+  const models = await cdp.evaluate(`(async () => {
+    const btn = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === '模型');
+    if (!btn) return JSON.stringify({ error: '没有「模型」板块入口' });
+    btn.click();
+    await new Promise((r) => setTimeout(r, 1200));
+    const text = document.body.innerText.replace(/\\s+/g, ' ');
+    return JSON.stringify({
+      hasTemp: text.includes('temperature'),
+      hasMaxRounds: text.includes('maxRounds'),
+      hasSpill: text.includes('spillMaxChars'),
+      hasCtx: text.includes('ctxLimit'),
+    });
+  })()`);
+  const M = JSON.parse(models);
+  ok(!M.error, `「模型」板块能打开（${M.error ?? 'ok'}）`);
+  if (!M.error) {
+    ok(M.hasTemp && M.hasCtx, '模型页有模型调用参数（temperature / ctxLimit）');
+    ok(!M.hasMaxRounds && !M.hasSpill, '模型页不再混入系统参数（轮次/spill 已挪到系统页）');
+  }
+
+  // 关掉抽屉
+  await cdp.evaluate(`(() => {
+    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === '关闭');
+    if (b) b.click();
+    return true;
+  })()`);
+  await sleep(400);
+}
+
+/* ────────────────────────── 手机（<md）布局 ──────────────────────────
+   需求：手机上顶栏**只有两个按键** —— 左＝会话抽屉、右＝设置抽屉；其余信息（模型状态、
+   项目名、上下文环、实时状态）与面板入口（待办/日志）一律不显示，一切以手机好用为准。
+   这一段把窗口改成 390×844 真跑一遍：位置/宽度/开合/互斥/隐藏全部量出来。
+   量之前先关掉桌面那段遗留在状态里的抽屉与遮罩（settings 抽屉仍可能开着）。 */
+console.log('\n【手机布局】');
+{
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+  await cdp.send('Page.navigate', { url: `http://127.0.0.1:${PORT}/` });
+  await sleep(5200);
+
+  const M = JSON.parse(await cdp.evaluate(`(() => {
+    const hdr = document.querySelector('header');
+    const vis = (el) => Boolean(el && el.offsetParent !== null && el.getBoundingClientRect().width > 0);
+    const btns = [...hdr.querySelectorAll('button')].map((b) => {
+      const r = b.getBoundingClientRect();
+      return { label: (b.textContent || b.getAttribute('aria-label') || '').trim(), title: b.getAttribute('title') || '', vis: vis(b), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+    });
+    const left = document.querySelector('[aria-label="会话列表"]');
+    const right = document.querySelector('[aria-label="设置"]');
+    const lr = left?.getBoundingClientRect();
+    const rr = right?.getBoundingClientRect();
+    const rightCol = document.querySelector('[aria-label="右列"]');
+    return JSON.stringify({
+      headerH: Math.round(hdr.getBoundingClientRect().height),
+      vw: window.innerWidth,
+      visible: btns.filter((b) => b.vis).map((b) => b.label),
+      sizes: btns.filter((b) => b.vis).map((b) => b.w + 'x' + b.h),
+      leftAtLeftEdge: Boolean(lr) && lr.x < 40,
+      rightAtRightEdge: Boolean(rr) && rr.right > window.innerWidth - 40,
+      rightColShown: Boolean(rightCol && vis(rightCol)),
+      titleStill: vis(document.querySelector('header span.min-w-0')),
+      docScroll: document.scrollingElement.scrollHeight - document.scrollingElement.clientHeight,
+      truncated: [document.documentElement.scrollWidth, document.body.scrollWidth],
+    });
+  })()`));
+  ok(M.headerH === 56, `手机顶栏仍是 h-14（${M.headerH}px）`);
+  ok(M.visible.length === 2, `顶栏只剩 2 个按键（实际 ${M.visible.length} 个：${M.visible.join(' / ')}）`);
+  ok(M.visible.join('|') === '会话列表|设置', `两个按键是「会话列表」与「设置」（实际：${M.visible.join(' / ')}）`);
+  ok(M.leftAtLeftEdge && M.rightAtRightEdge, '会话键在左、设置键在右（贴住两侧）');
+  ok(M.sizes.every((s) => s.split('x').every((n) => Number(n) >= 40)), `手指点得中（每个 ${M.sizes.join('、')}）`);
+  ok(!M.rightColShown, '手机不占位右列（待办/文件改动列整列隐藏）');
+  ok(M.titleStill, '顶栏还留着会话标题（只留标题这一条即时信息）');
+  ok(M.docScroll <= 1 && M.truncated.every((w) => w <= M.vw + 1), `不出现横向滚动或整页滚动（doc ${M.docScroll}px，宽 ${M.truncated.join('/')} vs ${M.vw}）`);
+
+  // 左键 → 会话抽屉（86vw 宽、从左边滑出、带遮罩）
+  await cdp.evaluate(`(() => { document.querySelector('[aria-label="会话列表"]').click(); return true; })()`);
+  await sleep(700);
+  const S = JSON.parse(await cdp.evaluate(`(() => {
+    const side = document.querySelector('aside');
+    const r = side.getBoundingClientRect();
+    return JSON.stringify({ x: Math.round(r.x), w: Math.round(r.width), vw: window.innerWidth, attr: document.documentElement.dataset.drawer || '' });
+  })()`));
+  ok(S.x === 0 && S.w > 0, `点会话键打开左侧抽屉（x=${S.x}，宽 ${S.w}px）`);
+  ok(S.w / S.vw > 0.75 && S.w / S.vw < 0.95, `抽屉留一条边能看到消息区（${S.w}/${S.vw}）`);
+  ok(S.attr === 'sessions', '抽屉开合状态写在 <html data-drawer> 上（便于互斥与检查）');
+
+  // 点遮罩关掉；再开设置抽屉（占满整屏、靠右、顶部有行内「关闭」）
+  await cdp.evaluate(`(() => { const m = [...document.querySelectorAll('div')].find(d => { const c = String(d.className || ''); return c.includes('fixed') && c.includes('inset-0') && c.includes('bg-black/50') && c.includes('md:hidden'); }); m?.click(); return Boolean(m); })()`);
+  await sleep(500);
+  await cdp.evaluate(`(() => { document.querySelector('[aria-label="设置"]').click(); return true; })()`);
+  await sleep(900);
+  const D = JSON.parse(await cdp.evaluate(`(() => {
+    const all = [...document.querySelectorAll('div')].map((d) => String(d.className || ''));
+    const drawer = [...document.querySelectorAll('div')].find((d) => String(d.className || '').includes('fixed inset-0 z-50'));
+    const r = drawer?.getBoundingClientRect();
+    const close = [...drawer.querySelectorAll('button')].find((b) => b.textContent.trim() === '关闭');
+    const ca = close?.getBoundingClientRect();
+    const tabs = [...drawer.querySelectorAll('button[data-section]')].map((b) => ({ n: b.textContent.trim(), h: Math.round(b.getBoundingClientRect().height) }));
+    return JSON.stringify({
+      open: Boolean(drawer),
+      x: r ? Math.round(r.x) : -1,
+      w: r ? Math.round(r.width) : 0,
+      vw: window.innerWidth,
+      hasClose: Boolean(close),
+      closeTouch: ca ? Math.round(ca.height) : 0,
+      tabs: tabs.length,
+      tabMinH: tabs.length ? Math.min(...tabs.map((t) => t.h)) : 0,
+      attr: document.documentElement.dataset.drawer || '',
+    });
+  })()`));
+  ok(D.open, '点设置键打开设置抽屉');
+  ok(D.w / D.vw > 0.9 && D.x >= 0, `手机上设置抽屉占满整屏（${D.w}/${D.vw}）`);
+  ok(D.hasClose && D.closeTouch >= 36, `顶部有行内「关闭」（高 ${D.closeTouch}px，够点）`);
+  ok(D.tabs >= 10 && D.tabMinH >= 40, `十个板块页签都够大（${D.tabs} 个，最小高 ${D.tabMinH}px）`);
+  ok(D.attr === 'settings', '设置抽屉开着时 data-drawer=settings');
+
+  // 互斥：设置抽屉开着时点会话键 → 设置收起、会话抽屉出来
+  await cdp.evaluate(`(() => { document.querySelector('[aria-label="会话列表"]').click(); return true; })()`);
+  await sleep(700);
+  const X = JSON.parse(await cdp.evaluate(`(() => {
+    const side = document.querySelector('aside');
+    const sr = side.getBoundingClientRect();
+    const drawer = [...document.querySelectorAll('div')].find((d) => String(d.className || '').includes('fixed inset-0 z-50'));
+    return JSON.stringify({ sideX: Math.round(sr.x), drawerOpen: Boolean(drawer), attr: document.documentElement.dataset.drawer || '' });
+  })()`));
+  ok(X.sideX === 0 && X.attr === 'sessions', '开会话抽屉时设置抽屉自动收起（两个抽屉不同时出现）');
+  ok(!X.drawerOpen, '设置抽屉确实不在了');
+
+  // 收尾：关掉侧栏遮罩，恢复桌面视口
+  await cdp.evaluate(`(() => { const m = [...document.querySelectorAll('div')].find(d => { const c = String(d.className || ''); return c.includes('fixed') && c.includes('inset-0') && c.includes('bg-black/50') && c.includes('md:hidden'); }); m?.click(); return true; })()`);
+  await sleep(400);
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1680, height: 1000, deviceScaleFactor: 1, mobile: false });
+  await sleep(500);
+  const back = JSON.parse(await cdp.evaluate(`(() => {
+    const side = document.querySelector('aside');
+    const hdr = document.querySelector('header');
+    const vis = (el) => Boolean(el && el.offsetParent !== null && el.getBoundingClientRect().width > 0);
+    return JSON.stringify({
+      sideVisible: vis(side),
+      btns: [...hdr.querySelectorAll('button')].filter(vis).length,
+      rightCol: vis(document.querySelector('[aria-label="右列"]')),
+      sideX: Math.round(side.getBoundingClientRect().x),
+    });
+  })()`));
+  ok(back.sideVisible && back.sideX === 0, '回到宽屏：会话列照旧常驻（没有被手机样式带歪）');
+  ok(back.btns > 2, `宽屏顶栏恢复全部按键（${back.btns} 个）`);
+  ok(back.rightCol, '宽屏右列（待办）照旧占位');
 }
 
 /* ────────────────────────── 收尾 ────────────────────────── */

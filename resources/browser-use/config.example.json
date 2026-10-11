@@ -1,0 +1,10 @@
+{
+  "headless": true,
+  "max_steps": 50,
+  "timeout": 600,
+  "extensions": true,
+  "max_completion_tokens": 8192,
+  "loose_structured_output": true,
+  "chrome_args": [],
+  "default_headers": {}
+}

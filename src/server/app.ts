@@ -13,6 +13,7 @@ import { createResourceRegistry } from '../modules/resources/index.ts';
 import { createRunRegistry } from './runs.ts';
 import { seedBuiltin as seedSkills } from '../modules/skills/index.ts';
 import { createAuth } from './auth.ts';
+import { migrateLegacySubagentRounds, readSettings, saveSettings } from '../store/settings.ts';
 
 const log = logger('app');
 
@@ -31,6 +32,15 @@ export function createApp(): AppCtx {
 
   prompts.register(corePromptDefs());
   seedSkills();
+
+  /* 一次性迁移：旧存档 settings.params.subagentMaxRounds → 子智能体插件参数 max_rounds。
+     必须在建插件登记表**之前**做（否则读到的还是迁移前的 plugins.json）。 */
+  const migratedSubRounds = migrateLegacySubagentRounds();
+  if (migratedSubRounds) {
+    // 让 settings 归一（旧字段消失）；插件登记表随后读到迁移后的值
+    saveSettings(readSettings());
+    log.info('已迁移旧的「子智能体轮次上限」到子智能体插件参数', { max_rounds: migratedSubRounds });
+  }
 
   const plugins = createPluginRegistry();
   const resources = createResourceRegistry();

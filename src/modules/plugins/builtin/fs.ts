@@ -8,7 +8,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import type { PluginDef, Tool, ToolRunCtx } from '../types.ts';
+import type { PluginDef, Tool, ToolResult, ToolRunCtx } from '../types.ts';
 
 /**
  * 约定：ToolResult.files 只放**可交付的产物**（在待下载目录里、能点开下载的东西）。
@@ -41,6 +41,7 @@ async function readFile(args: Record<string, unknown>, ctx: ToolRunCtx) {
   if (stat.size > 8 * 1024 * 1024 && !args.force) {
     return {
       ok: false,
+      errorCode: 'INVALID_ARGS' as const,
       text: `${file} 有 ${fmtBytes(stat.size)}，超过 8MB。若确实要整读，请显式传 force=true；否则用 start_line/lines 分段读，或用 run_command 处理。`,
     };
   }
@@ -56,17 +57,33 @@ async function readFile(args: Record<string, unknown>, ctx: ToolRunCtx) {
   };
 }
 
+/**
+ * 写盘前的统一动作：**先打快照，再落盘**。
+ *
+ * 顺序不能反：快照记的是"动手前"的样子，撤回就是回到它。
+ * 快照失败不能让写入失败（写文件才是正事），所以这里只吞掉返回值、由工具照常写。
+ */
+async function beforeWrite(ctx: ToolRunCtx, label: string, files: string[]): Promise<void> {
+  if (!ctx.changes) return;
+  try {
+    await ctx.changes.snapshot(label, files);
+  } catch {
+    /* 快照是尽力而为的附加能力 */
+  }
+}
+
 async function writeFile(args: Record<string, unknown>, ctx: ToolRunCtx) {
   const file = resolve(ctx, args.path);
   const content = String(args.content ?? '');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  await beforeWrite(ctx, `write_file ${path.relative(ctx.cwd, file) || file}`, [file]);
   fs.writeFileSync(file, content, 'utf8');
   ctx.log.info('write_file', { file, bytes: Buffer.byteLength(content) });
   const lines = diffLines(before ?? '', content);
   return {
     ok: true,
-    text: `${before === null ? '已创建' : '已覆盖'}：${file}（${fmtBytes(Buffer.byteLength(content))}${lines ? `，+${lines.added}−${lines.removed} 行` : ''}）`,
+    text: `${before === null ? '已创建' : '已覆盖'}：${file}（${fmtBytes(Buffer.byteLength(content))}${lines ? `，+${lines.added}−${lines.removed} 行` : ''}）\n（改动已记入检查点，需要撤回用 changes 工具）`,
     note: before === null ? '新建文件' : `覆盖 +${lines?.added ?? 0}−${lines?.removed ?? 0}`,
     lines,
   };
@@ -74,23 +91,24 @@ async function writeFile(args: Record<string, unknown>, ctx: ToolRunCtx) {
 
 async function editFile(args: Record<string, unknown>, ctx: ToolRunCtx) {
   const file = resolve(ctx, args.path);
-  if (!fs.existsSync(file)) return { ok: false, text: `文件不存在：${file}（新建请用 write_file）` };
+  if (!fs.existsSync(file)) return { ok: false, errorCode: 'NOT_FOUND' as const, text: `文件不存在：${file}（新建请用 write_file）` };
   const before = fs.readFileSync(file, 'utf8');
   const find = String(args.old_string ?? '');
   const replace = String(args.new_string ?? '');
-  if (!find) return { ok: false, text: 'old_string 不能为空' };
+  if (!find) return { ok: false, errorCode: 'INVALID_ARGS' as const, text: 'old_string 不能为空' };
   const count = before.split(find).length - 1;
-  if (count === 0) return { ok: false, text: `没找到要替换的内容。old_string 必须与文件内容逐字一致（含缩进）。提示：先用 read_file 看原文。` };
+  if (count === 0) return { ok: false, errorCode: 'NOT_FOUND' as const, text: `没找到要替换的内容。old_string 必须与文件内容逐字一致（含缩进）。提示：先用 read_file 看原文。` };
   if (count > 1 && !args.replace_all) {
-    return { ok: false, text: `old_string 在文件里出现 ${count} 次，不唯一。请带上更多上下文让它唯一，或传 replace_all=true 全部替换。` };
+    return { ok: false, errorCode: 'INVALID_ARGS' as const, text: `old_string 在文件里出现 ${count} 次，不唯一。请带上更多上下文让它唯一，或传 replace_all=true 全部替换。` };
   }
+  await beforeWrite(ctx, `edit_file ${path.relative(ctx.cwd, file) || file}`, [file]);
   const after = args.replace_all ? before.split(find).join(replace) : before.replace(find, replace);
   fs.writeFileSync(file, after, 'utf8');
   ctx.log.info('edit_file', { file, count });
   const lines = diffLines(before, after);
   return {
     ok: true,
-    text: `已修改：${file}（替换 ${args.replace_all ? count : 1} 处，+${lines?.added ?? 0}−${lines?.removed ?? 0} 行）`,
+    text: `已修改：${file}（替换 ${args.replace_all ? count : 1} 处，+${lines?.added ?? 0}−${lines?.removed ?? 0} 行）\n（改动已记入检查点，需要撤回用 changes 工具）`,
     note: `改 ${args.replace_all ? count : 1} 处`,
     lines,
   };
@@ -220,8 +238,9 @@ async function moveFile(args: Record<string, unknown>, ctx: ToolRunCtx) {
   const from = resolve(ctx, args.from);
   const to = resolve(ctx, args.to);
   fs.mkdirSync(path.dirname(to), { recursive: true });
+  await beforeWrite(ctx, `move_file ${path.relative(ctx.cwd, from) || from} → ${path.relative(ctx.cwd, to) || to}`, [from, to]);
   fs.renameSync(from, to);
-  return { ok: true, text: `已移动：${from} → ${to}`, note: '移动' };
+  return { ok: true, text: `已移动：${from} → ${to}\n（改动已记入检查点，需要撤回用 changes 工具）`, note: '移动' };
 }
 
 async function deletePath(args: Record<string, unknown>, ctx: ToolRunCtx) {
@@ -231,14 +250,17 @@ async function deletePath(args: Record<string, unknown>, ctx: ToolRunCtx) {
     if (!args.recursive) {
       const n = fs.readdirSync(target).length;
       if (n > 0) return { ok: false, text: `${target} 是非空目录（${n} 项）。确认要删就传 recursive=true。` };
+      await beforeWrite(ctx, `delete_path ${path.relative(ctx.cwd, target) || target}`, [target]);
       fs.rmdirSync(target);
       return { ok: true, text: `已删除空目录：${target}`, note: '删目录' };
     }
+    await beforeWrite(ctx, `delete_path -r ${path.relative(ctx.cwd, target) || target}`, [target]);
     fs.rmSync(target, { recursive: true, force: true });
   } else {
+    await beforeWrite(ctx, `delete_path ${path.relative(ctx.cwd, target) || target}`, [target]);
     fs.rmSync(target);
   }
-  return { ok: true, text: `已删除：${target}`, note: '删除' };
+  return { ok: true, text: `已删除：${target}\n（删除前的状态已记入检查点，需要找回用 changes 工具）`, note: '删除' };
 }
 
 /** 行数差异（新增/删除行数，移动的行不计）——与 git diff --stat 同口径的近似 */
@@ -275,7 +297,7 @@ export function fsTools(): Tool[] {
   const t = (
     name: string,
     schema: Record<string, unknown>,
-    run: (a: Record<string, unknown>, c: ToolRunCtx) => Promise<{ ok: boolean; text: string; note?: string; lines?: { added: number; removed: number }; files?: string[] }>,
+    run: (a: Record<string, unknown>, c: ToolRunCtx) => Promise<ToolResult>,
   ): Tool => ({
     name,
     pluginId: 'fs',

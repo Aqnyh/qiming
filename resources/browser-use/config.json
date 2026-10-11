@@ -1,8 +1,0 @@
-{
-  "headless": true,
-  "max_steps": 50,
-  "timeout": 600,
-  "extensions": true,
-  "proxy": "http://127.0.0.1:7890",
-  "max_completion_tokens": 8192
-}

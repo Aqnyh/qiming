@@ -2,7 +2,7 @@
  * ui/features/settings/ProjectsSection.jsx —— 项目（需求 3，从「模型与参数」里独立出来）。
  *
  * 规则：**一切项目都在工作区之下**。工作区是这台机器上放项目的根目录（默认
- * /media/leo/DATA/workspace），目录选择器只在工作区内浏览、不允许往上越界，
+ * 工作区根目录（可在「设置 → 项目」里改；占位符仅为示例）。目录选择器只在工作区内浏览、不允许往上越界，
  * 服务端也会再校验一遍（前端限制只是体验，真正的边界在服务端）。
  *
  * 每个项目三件事：名字（显示用）、路径（会话的默认工作目录，也是命令的 cwd）、
@@ -151,7 +151,7 @@ export default function ProjectsSection() {
       >
         <div className="flex flex-wrap items-end gap-2">
           <Field label="工作区根目录" className="min-w-[16rem] flex-1">
-            <Input value={draftWs} onChange={(e) => setDraftWs(e.target.value)} placeholder="/media/leo/DATA/workspace" />
+            <Input value={draftWs} onChange={(e) => setDraftWs(e.target.value)} placeholder="/home/you/workspace" />
           </Field>
           <Btn size="sm" variant="primary" disabled={busy || !draftWs.trim() || draftWs.trim() === workspace} onClick={() => void saveWorkspace()}>
             {busy ? <Spinner className="size-3" /> : null}

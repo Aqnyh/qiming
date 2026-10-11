@@ -23,6 +23,7 @@ qiming/
     server/runs.ts       运行注册表：多会话并发、插话、停止、事件订阅
     server/runner.ts     运行宿主：组装→循环→落盘→事件；含事件/运行日志存储
     agent/loop.ts        循环内核（与传输无关，只依赖注入的 provider 与 toolRun）
+    agent/rounds.ts      轮次上限的唯一判定处（主运行 + 子智能体，纯函数，单测钉住）
     agent/prompt.ts      系统提示词组装（插件/记忆/技能/资源 → system 块）
     agent/context.ts     token 估算、压缩、请求视图
     agent/tools.ts       工具登记与执行（插件/记忆/技能/资源/子智能体统一入口）
@@ -71,8 +72,14 @@ qiming/
 - 守卫（移植旧项目验证过的）：截断保护（`stop==='length'`/参数损坏不执行只回话）、
   空回答守卫、重复工具调用守卫（只拦成功过的写类空转）、轮次上限、思考死循环检测、上游错误重试。
 - 预算：每个插件自带参数（如命令条数、等待次数）；用户设多少就是多少，**服务端不设硬上限**。
-  循环总轮次 = 各插件预算之和 + 2，只是防止程序性死循环。
-- 插话：运行中收到同一会话的新消息 → 记入 `run.steer`，在下一轮次模型调用前注入。
+- 轮次上限（`src/agent/rounds.ts` 是**唯一判定处**）：
+  · 用户在「设置 → 模型与参数」填的 `maxRounds`（`0` = 自动）→ 用多少就是多少，**没有硬封顶**；
+  · 自动 = 各启用插件 `max_calls` 之和 + 2（"够把所有插件的额度用光"）；
+  · 子智能体另有一套：工具入参 `max_rounds` → 设置里的 `subagentMaxRounds` → 插件参数 → 内置 12。
+  曾经这里写过"服务端封 200"、也真的静默封过顶 —— 用户填 300 实际只跑 200 且不报错，
+  所以现在把规则收到一个纯函数里、单测直接钉住。真跑飞了用界面上的「停止」中断。
+- 插话/排队：见「八之三」「八之十」—— 运行中收到同一会话的新消息**先进队列**，
+  按 `steer`（安全点注入）/ `urgent`（掐当前调用）/ `queue`（这一段之后）三种语义兑现。
 
 ## 五、四个模块
 
@@ -122,8 +129,13 @@ data/
   projects/<id>/memory/ MEMORY.md + <slug>.md（项目记忆）
   skills/<name>/        SKILL.md（+ scripts/ references/）
   runs/<runId>/         events.jsonl（事件日志）、calls/<seq>.json（工具全文）、thinking/<msgId>.md
+                        、spills/<seq>-<工具>.txt（超长工具结果落盘）
   archives/             会话归档
 ```
+
+会话历史的**唯一真源**是 `session.log`（append-only 事件日志，见 `store/session-log.ts`）；
+`session.msgs` 是它的**派生物**（`deriveMessages`），任何时刻可由日志重建。旧存档没有 log 时，
+读入自动反向补一份，行为与旧版逐条一致。
 
 记忆文件格式（与 ZCode/旧项目兼容，可直接拷）：
 
@@ -174,7 +186,9 @@ metadata:
 参照主流做法（Claude Code 的 Task / Codex 的子代理）：
 
 - **独立上下文**：主会话历史不带过去，只带一段交办说明（目标 + 已知信息 + 期望结论形式）；
-- **独立运行**：有自己的 runId、自己的预算与轮次上限（插件参数 `max_rounds`，默认 12），
+- **独立运行**：有自己的 runId、自己的预算与轮次上限。轮次优先级（`resolveSubRounds`）：
+  工具入参 `max_rounds` → 设置里的 `subagentMaxRounds`（界面可改）→ 插件参数 `max_rounds`
+  → 内置 12（下限 2）。**没有硬封顶**，填多少跑多少。
   事件照常广播（界面里能单独展开它的转录），但**不写用户会话**（临时会话，只在内存）；
 - **默认继承工具、但拿不到 spawn_agent**（不递归，防止套娃失控）；
   `read_only=true` 时只给读类工具；
@@ -182,7 +196,7 @@ metadata:
 
 ## 八之二、工作区与项目
 
-- **工作区**（`settings.workspace`，默认 `/media/leo/DATA/workspace`）：放项目的根目录。
+- **工作区**（`settings.workspace`，默认 `~/workspace` 的上一级，可在「设置 → 项目」改）：放项目的根目录。
 - **一切项目都在工作区之下**：`POST /api/projects`、`POST /api/projects/<id>`（改路径）与
   `GET /api/browse` 三处都校验（用 `path.relative` 判定，`/a/bc` 不会被误判为在 `/a/b` 内）；
   目录选择器到工作区根就返回 `parent: null`，点不出去。
@@ -229,9 +243,10 @@ metadata:
 - 消息区与输入框在**同一列**（所以宽度天然同步）；待办是**真实的一列**而不是浮层，
   因此它有自己的滚动条、也不会盖住消息。
 - 待办抽屉**常驻右侧**（`todoOpen` 默认开，宽 16rem）：没有清单时显示说明而不是整列消失 ——
-  否则消息区会随清单出现/消失忽宽忽窄。窄屏（<sm）不占位，靠顶栏按钮看。
-- 归档：`session.archivedAt` / `project.archivedAt`。归档项目的接口返回**活跃**会话列表
-  （界面拿它直接当侧栏数据），归档条数另给 `archivedCount` —— 早先这里返回了归档列表，
+  否则消息区会随清单出现/消失忽宽忽窄。宽屏（≥sm）常驻；**手机（<sm）整列不占位**（见八之十二）。
+  这里踩过一个 Tailwind v4 的坑：`hidden ... sm:flex` 里后面的 `w-64` 会把 `hidden` 顶掉
+  （同层工具类按源码顺序生效），所以"手机不占位"必须写成 `max-sm:hidden`。
+- 归档：`session.archivedAt` / `project.archivedAt`。归档项目的接口返回**活跃**会话列表  （界面拿它直接当侧栏数据），归档条数另给 `archivedCount` —— 早先这里返回了归档列表，
   造成"归档后侧栏变成显示已归档的会话、刷新才恢复"（第八轮修，UI 检查有回归断言）。侧栏只能归档；彻底删除只在归档页，
   且服务端要求"先归档"（未归档直接 DELETE 返回 409）。归档项目会连带归档它的会话，
   恢复同理；彻底删除项目会删掉项目记忆目录与它的会话记录，**不碰磁盘上的项目文件**。
@@ -321,16 +336,39 @@ aborted → urgent（立即执行）→ cut（掐断守卫）→ streamError（�
 - **顺带**：循环自己产生的一句收尾文案（"反复中断已停止续跑"等）改为走 `onContentDelta` ——
   正文既然由流式增量拼成，只在 `finalText` 里返回的文案就会看不见。
 
-## 八之十、排队队列（2026-10-10 第九轮）
+## 八之十、排队队列与三种「运行中发消息」（2026-10-10 第九轮，第十轮重做语义，第十一轮改默认）
 
-交互：运行中发消息 = **排队**（不再直接插进对话）。队列在**输入框上方**、可折叠，
-每条可单独「立即执行」或删除；没执行的不进消息区。参照 Codex 的 Enter 入队 + Claude Code 的打字排队。
+交互：运行中发消息**先进队列**（不再直接插进对话）。队列在**输入框上方**、可折叠，
+每条可单独「立即执行」或删除；没执行的不进消息区。
+
+**三种语义（`SteerMode`）—— 这一版的核心是"别把三者混成一件事"**：
+
+| mode | 何时生效 | 实现 | 界面入口 |
+|---|---|---|---|
+| `queue`（**默认**） | **当前这一段运行跑完之后**，自动接着执行（新开一段） | 只由 `flushQueue` 兑现 | Enter（默认） |
+| `steer`（插话） | **当前轮次之内**，最近的**安全点** | 循环在轮次边界与"每次工具调用之后"取走并注入 | Alt+Enter |
+| `urgent`（立即执行） | **立刻**（掐掉当前模型调用/工具） | `run.currentCall.abort()` + `takeUrgent()`，判定排在重试/超时之前 | 队列条上的「立即执行」 |
+
+**第十一轮的关键修正（用户明确要求）**：默认从 `steer` 改成 `queue`。
+旧版默认 `steer`，"运行中再发一句"会**插进当前轮次**（下个安全点就生效），与用户
+"先把手上的事做完、这一段结束后再做新排的"的预期不符。现在：
+- **Enter（默认）= 排队**，当前这一段跑完后自动执行；
+- **只有「立即执行」会在当前轮次内反馈**（它是唯一的"插队"入口，`urgent`）；
+- `steer` 仍保留为显式选项（Alt+Enter），想要当前轮次内注入时用。
+- 默认值本身是**系统参数** `queueDefault`（设置 → 系统），出厂 `queue`，用户可改。
+
+参照：dsh 的 inbox 两级 `next-turn`/`next-step`（`packages/core/agent-loop/src/inbox.ts`）
+与 zcode-cli 的 Enter=同轮次 steering / Tab=下一轮次队列（其 README 的 "Active-turn input"）。
 
 - **队列挂在会话上**（`runs.ts` 的 `queues`，不是挂在运行上）：挂在运行上会出现
   "运行结束了队列里的消息再也执行不了"的悬挂状态。`QueueItem = {id,text,ts,mode}`。
-- **兑现时机**：轮次边界（`takeQueued`，urgent 优先）；**运行结束还有剩的就自动开下一段**（`flushQueue`）。
+- **兑现时机**：`steer`/`urgent` 由 `takeQueued` 在运行内取走；`queue` 只在运行结束时由
+  `flushQueue` 接着开下一段（**不会永远挂着**）。
+- **安全点**：模型调用之后（拿完这一轮的 tool_calls）与每次工具调用之后各一次 ——
+  只在轮次边界注入的话，"最后一轮没有工具调用"时插话就永远进不来（实测的缺口）。
 - **接口**：`GET /api/run/queue?sessionId=`、`POST /api/run/queue {sessionId,id,action:'execute'|'remove'}`；
-  `GET /api/session/<id>` 顺带返回 `queue`（刷新后排队条能恢复）。
+  `GET /api/session/<id>` 顺带返回 `queue`（刷新后排队条能恢复）。`POST /api/chat` 不传
+  `mode` 时用系统参数 `queueDefault` 决定语义。
 - **多观察者**：入队与"改成立即执行"都会 `broadcast` 一条 `steer` 事件（`state:'queued'`），
   取走时 `state:'taken'` —— 另一个标签页/设备也看得到队列。
 - **两个实测坑**：① 客户端入队会从**两条通道**回来（POST 响应 + `queued` 广播），
@@ -338,11 +376,111 @@ aborted → urgent（立即执行）→ cut（掐断守卫）→ streamError（�
   ② 队列用例依赖"运行确实还在跑"的窗口，3.6s 的慢流偶发错过（入队瞬间这一轮已收尾，
   队列被自动兑现）→ 测试改用 60s 的"超慢任务"模式。
 
+## 八之十一、文件改动：检查点 + 右侧大抽屉（2026-10-10 第十轮）
+
+- **数据**：影子 git 仓库（`src/store/checkpoints.ts`，每条会话一棵，见该文件头部注释）。
+  `GET /api/changes/diff` 返回**结构化**逐行数据（`files[].lines[] = {oldNo,newNo,kind,text}`）
+  与纯文本 `text` 两份 —— 界面用结构化的那份，命令行/复制用文本。
+- **界面**：右列只留一条窄入口（"文件改动 · N"），点开是**占大半屏的右侧抽屉**
+  （`ChangesPanel.jsx` 的 `ChangesDrawer`，挂在应用顶层）：左边检查点清单、右边 diff。
+  右列 256px 放不下行号与并排视图，所以抽屉必须独立于右列。
+- **diff 视图**（`DiffView.jsx` + 纯函数 `ui/lib/diff-rows.js`）：统一/并排两种；
+  行号双列、增删底色、中间上下文折叠成「展开 N 行」。折叠的 `from/to` 指向**真正被藏起来的那段**
+  （头尾 3 行已经单独显示）—— 曾经记的是整段上下文，于是"展开 7 行"推 10 行、头尾各重复 3 行。
+- **三个实测坑**：
+  ① 并排视图里落单的一侧是 `null`，`Line` 组件**先读 `line.kind` 再判空**会抛 TypeError，
+  React 卸载整棵子树 → "一点「并排」抽屉就消失"。判空必须放最前；
+  ② 影子仓库自带忽略清单（`out/`、`node_modules/`…），而 agent 亲写的文件恰恰可能落在里面 ——
+  被忽略就等于 diff 里完全看不见。申报过的普通小文件用 `git add -f` 强记；
+  ③ `git add` 是"全成功或全失败"：一条坏路径会拖垮整批，所以分批 + 失败退化成逐条重试。
+
+## 八之十二、手机（<md）界面：两个按键、两个抽屉（2026-10-10 第十三轮）
+
+需求原话：手机 UI 左＝会话抽屉、右＝设置抽屉，**都用按键实现**；其余日志等信息不显示，
+一切以手机界面好用为准。落地如下（全部是 CSS 断点，没有 JS 端的设备分支）：
+
+| 位置 | 手机（<md，≥ 手机竖屏） | 宽屏（≥md） |
+|---|---|---|
+| 顶栏 | **只有两个 40×40 的按键**：左「会话列表」、右「设置」；中间只留会话标题 | 模型状态 · 项目 · 会话名 · 上下文环 · 待办/日志/待下载/设置 |
+| 会话列表 | 抽屉：`w-[86vw]` 从左侧滑出，点会话/遮罩即收；顶部让开刘海（safe-area） | 常驻左侧 16rem |
+| 设置 | 抽屉：占满整屏、靠右、顶部一行固定的「设置 / 关闭」，十个板块是 44px 高的横向滚动页签 | 右侧 `max-w-4xl`，板块导航在左 |
+| 右列（待办/压缩/子智能体/文件改动） | **整列不占位**（`max-sm:hidden`）：390px 再切 256px 只剩半屏 | 常驻 16rem |
+| 消息区/输入框 | 左右内边距归零；发送/停止键高 40px；输入区字体 ≥16px（防 iOS 聚焦放大） | 两侧各 20px |
+| 触屏细节 | `@media (pointer:coarse)`：会话行的置顶/归档**常显**（没有 hover 可悬），行内时间戳藏掉 | 悬停才出现 |
+
+两个抽屉**互斥**：`openDrawer()` 收侧栏、`toggleSidebar()` 收设置 —— 否则两个 `fixed` 全高
+抽屉的遮罩会叠在一起。状态是一处算完的（`ui/state/session.js` 的 `markDrawer()`）：
+同时写到 `<html data-drawer="sessions|settings">`，既让"哪个抽屉开着"只有一个真源，
+也让真机检查能直接量（不用猜 React 内部状态）。
+
+**回归断言**：`test/ui-check.mjs` 末尾的「手机布局」段把视口切到 390×844 真跑一遍 ——
+顶栏按键数 = 2 且分别是「会话列表」/「设置」、两个键 ≥40px、右列不占位、无横向滚动、
+抽屉宽度与开合、`data-drawer`、互斥、以及**切回 1680 宽后会话列/右列照旧**（防手机样式带歪宽屏）。
+
 ## 九、明确不做（本期）
 
 - 多用户、账号表、权限级别、工具白名单、审计日志（需求 2：安全保障最后再考虑）。
 - 旧项目的确认（confirm）机制、单窗口互斥、本机账号绑定、deny 危险命令清单。
 - 屏幕操作不再使用 OmniParser + xdotool 方案，整组删除。
+
+## 九之二、借鉴主流 harness 的六项改造（2026-10-10 第十一轮）
+
+对照 `deepseek-ai/deepseek-harness` 的内核（Cordis 微内核 + spill + 事件溯源会话 + turn/step + 子智能体家族），
+挑可借鉴处**按性价比**逐条落地。原则统一：**参数不设服务端硬上限、全部在 UI 可见可改**；
+**一切操作可执行、一切可见、一切可改、一切有记录、可追溯、可审查、易维护**。
+
+1. **工具结果 spill**（`src/agent/spill.ts`）—— 超大工具输出落盘，只把「头尾预览 + 可 read_file
+   的路径」回灌给模型（journal 仍存全文，可审计）。参数 `spillEnabled / spillMaxChars /
+   spillHeadChars / spillTailChars`（设置 → 模型与参数）。落盘失败退回内联，绝不丢结果。
+   界面追踪条显示「全文落盘 N 字符」。
+2. **会话 append-only 事件日志**（`src/store/session-log.ts`）—— 会话历史的**唯一真源**改为一串
+   只追加、不可变、带自增 seq 的事件（`append / insert / replace / compact_add / compact_remove`）；
+   `session.msgs` 变为**派生物**（`deriveMessages(log)`）。旧存档读入时用 `legacyEventsFromMsgs()`
+   反向补日志，重放结果与原 `msgs` 逐条一致。根治了"就地改数组写歪、上游 400 还查不出原因"
+   （本工程真踩过）。日志可用 `GET /api/session/<id>/log`（`?raw=1`）审计，顶栏「日志」按钮可看。
+3. **工具结果标准错误码**（`ToolErrorCode`，`src/modules/plugins/types.ts`）—— `ABORTED_BEFORE_DISPATCH`
+   （未派发=没执行）/ `TOOL_OUTCOME_UNKNOWN`（已派发未应答=结果未知）/ `BUDGET_EXHAUSTED` /
+   `INVALID_ARGS` / `NOT_FOUND` / `EXEC_FAILED` / `UNKNOWN_TOOL` / `LOOP_GUARD`。
+   界面按码分类（追踪条显示错误码），不再靠中文文案正则猜。
+4. **turn / step 分离**（`src/agent/loop.ts`）—— `round` 一个数拆成：`turn`（用户输入划的段，
+   插话/打断即开新 turn）与 `step`（段内模型调用序号）。事件与落盘消息都带，统计行显示
+   `turn N · step M`。
+5. **子智能体可续 + 控制面**（`src/server/runs.ts` 的 `subagents` 登记表）—— 不再"带结论即消失"：
+   `spawn_agent` 开子体（登记内存会话）→ `subagent_send` 带着它自己的历史**续谈** →
+   `subagent_stop` 中断 → `subagent_list` 列举。`GET/POST /api/subagents` + 右列「子智能体」面板
+   （可续谈、可中断）。
+6. **压缩用「替换节点」**（`src/agent/context.ts`）—— 压缩状态从"掐前 N 条"改为**一串声明式节点**
+   `{id, from, to, text}`：可叠加（多次压缩各记各的，互不吞）、可审计、可撤回。
+   `DELETE /api/session/<id>/compact?node=` 撤回某节点（那段原历史回到请求视图）。右列
+   「上下文压缩」面板可见可撤回。旧单节点存档读入时归一化。
+
+验证：`npm run check` 91 项测试全绿（协议 / 模块 / 图像 / 端到端），`node test/ui-check.mjs` 59 项全绿。
+
+## 九之三、设置归属归一：模型 / 系统 / 插件（2026-10-10 第十二轮）
+
+**问题**：「模型与参数」一页把"发给上游那次请求"的东西（temperature/maxTokens）与
+"智能体怎么跑"的东西（轮次上限、并发、落盘、停滞看门狗、检查点条数）混在一起 ——
+概念上不是一类，界面像大杂烩，也不符合"参数归属清楚、可维护"的目标。
+
+**现在按归属拆成三处**（`src/store/settings.ts` 的 `ModelParams` / `SystemSettings`）：
+
+| 归属 | 内容 | 界面 | 存储 |
+|---|---|---|---|
+| **模型** | 服务商 + temperature / maxTokens / thinkingBudget / callTimeoutSec / retryCount / ctxLimit / echoThinking | 设置 → **模型** | `settings.params` |
+| **系统** | maxRounds / maxRuns / stallSec / autoContinue(+Max) / spill*(4) / checkpointLimit / queueDefault | 设置 → **系统** | `settings.system` |
+| **插件** | 每个插件自己的预算（子智能体的 `max_rounds` 就在子智能体插件里） | 设置 → **插件** | `plugins.json` 的 overrides |
+
+- **不设服务端硬上限**（需求）：系统页每个数字都是"填多少就多少"，0 的含义写进说明
+  （轮次 0 = 自动汇总插件额度；并发 0 = 不限；spill 0 = 关；检查点 0 = 全部列出）。
+- **旧存档无损迁移**：`normalize()` 里 `migrateSystem()` 把旧扁平 `params` 里的系统键
+  原样搬到 `system`，迁完从 `params` 删掉（`MODEL_KEYS` 白名单，脏字段不再堆）。
+  单测 `设置：旧版扁平 params 里的系统参数无损迁到 system` 钉住。
+- **子智能体轮次**从 `settings.params.subagentMaxRounds` 挪到**子智能体插件参数** `max_rounds`。
+  旧存档里设过的值由 `migrateLegacySubagentRounds()`（启动时、建插件表之前跑一次）
+  搬到 `plugins.json`，不丢。`resolveSubRounds({hint, pluginParam})` 的优先序随之简化。
+- **检查点列表条数**此前是 `checkpoints.ts` 里硬编码的 `-n 200`（列不出来也不可配），
+  现在读 `system.checkpointLimit`（0 = 不限）。注意：**检查点本身不会因超限被删**，
+  被截的只是列表窗口。
 
 ## 十、实现现状与已知缺口（2026-10-10）
 

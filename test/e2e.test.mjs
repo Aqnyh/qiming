@@ -136,6 +136,19 @@ function startUpstream() {
         chunk({}, 'stop');
         return res.end('data: [DONE]\n\n');
       }
+      /* 子智能体：请求里带「你是子智能体」开场白 = 这是子运行（它的工具表里没有 spawn_agent） */
+      const isSubRun = body.messages.some((m) => String(m.content ?? '').includes('你是子智能体'));
+      if (isSubRun) {
+        chunk({ content: `子体答复：${String(last?.content ?? '').slice(0, 40)}` });
+        chunk({}, 'stop');
+        return res.end('data: [DONE]\n\n');
+      }
+      /* 父请求要求「用子智能体」→ 第一轮发 spawn_agent，收到子体结论后再给最终回答 */
+      if (String(body.messages.filter((m) => m.role === 'user').map((m) => m.content).join(' ')).includes('用子智能体') && !sentToolResult) {
+        chunk({ tool_calls: [{ index: 0, id: 'call_sub', type: 'function', function: { name: 'spawn_agent', arguments: JSON.stringify({ task: '数一数目录里有几个文件' }) } }] });
+        chunk({}, 'tool_calls');
+        return res.end('data: [DONE]\n\n');
+      }
       if (!isToolsRequest) {
         chunk({ content: '（没有工具可用的普通回答）' });
         chunk({}, 'stop');
@@ -297,6 +310,13 @@ test('端到端：一轮带工具调用的运行（事件流 / 落盘 / 按需�
   assert.equal(msgs[1].calls[0].state, 'ok');
   assert.ok(msgs[1].stats.in >= 0 && msgs[1].stats.ms >= 0);
   assert.equal(msgs[1].runId, runId);
+  // turn/step 分离：这一段 = 1 个 turn（用户一次提问），走了 2 个 step（调工具 + 总结）
+  const rounds = events.filter((e) => e.type === 'round' && e.runId === runId);
+  assert.ok(rounds.length >= 2, '应有两个 round 事件');
+  assert.ok(rounds.every((r) => r.turn === 1), '一次提问只划出一个 turn');
+  assert.deepEqual(rounds.map((r) => r.step), rounds.map((_, i) => i + 1), 'step 在同一个 turn 内递增');
+  assert.equal(msgs[1].turn, 1, '落盘助手消息带 turn');
+  assert.ok(msgs[1].step >= 2, '落盘助手消息带 step');
 
   // ④ 按需取详情：调用的完整参数与结果
   const firstSeq = msgs[1].calls[0].seq;
@@ -311,6 +331,18 @@ test('端到端：一轮带工具调用的运行（事件流 / 落盘 / 按需�
   const thinking = await api('GET', `/api/run/${runId}/thinking/${msgs[1].id}`);
   assert.equal(thinking.status, 200);
   assert.match(thinking.json.text, /工具已执行/);
+
+  // ⑤b 会话事件日志：默认视图也必须带内容（教训：曾只回 {seq,type,ts}，界面看不到东西）
+  const logBrief = await api('GET', `/api/session/${sessionId}/log`);
+  assert.equal(logBrief.status, 200);
+  assert.ok(logBrief.json.count >= 2, '日志至少两条事件');
+  const firstEv = logBrief.json.events[0];
+  assert.equal(firstEv.type, 'append');
+  assert.equal(firstEv.role, 'user', '默认视图要带角色');
+  assert.equal(firstEv.content, '写一个文件', '默认视图要带正文（不是空壳）');
+  // 原始载荷：给完整事件对象（含 calls/thinking 等）
+  const logRaw = await api('GET', `/api/session/${sessionId}/log?raw=1`);
+  assert.ok(logRaw.json.events[1].msg.calls, '原始载荷带完整 calls');
   await ac.abort();
   await reader;
 
@@ -351,7 +383,7 @@ test('端到端：工作区约束（项目必须落在工作区之内，目录�
   assert.equal(badMove.status, 400, '改路径也要守工作区');
 });
 
-test('端到端：立即执行（urgent）打断当前模型调用，新指令插到最前', async () => {
+test('端到端：插话（steer）不打断，在安全点注入当前运行', async () => {
   const ac = new AbortController();
   const events = [];
   const reader = (async () => {
@@ -375,10 +407,64 @@ test('端到端：立即执行（urgent）打断当前模型调用，新指令�
   const { runId, sessionId } = first.json;
   await waitFor(() => events.some((e) => e.type === 'content' && e.runId === runId), { what: '慢任务开始出字', timeout: 10_000 });
 
-  // 此刻立即执行：应当打断当前调用（不等它吐完 30 片）
+  /* 插话：显式传 mode='steer'。**不掐掉**当前调用 —— 慢流本来要吐 3.6s，
+     如果插话把它打断了，总时长会明显短于 3.6s，所以这里用时长反过来验证"没打断"。 */
+  const t0 = Date.now();
+  const second = await api('POST', '/api/chat', { sessionId, text: '插一句：注意格式', mode: 'steer' });
+  assert.equal(second.status, 200);
+  assert.equal(second.json.steered, true);
+  assert.equal(second.json.mode, 'steer');
+  assert.equal(second.json.runId, runId, '插话不换运行，还是同一段');
+
+  const done = await waitFor(() => events.find((e) => e.type === 'run_end' && e.runId === runId), { what: '运行结束', timeout: 30_000 });
+  const elapsed = Date.now() - t0;
+  assert.equal(done.status, 'ok');
+  assert.ok(elapsed > 2000, `插话不该打断当前调用（实际 ${elapsed}ms；慢流 3.6s 应基本跑完）`);
+
+  // steer 事件两态：收下时广播 queued（别的设备也看得到队列），取走时广播 taken
+  const steers = events.filter((e) => e.type === 'steer' && e.runId === runId);
+  assert.ok(steers.some((e) => e.state === 'queued'), '收下要广播 queued（别的设备才看得到队列）');
+  const taken = steers.find((e) => e.state === 'taken');
+  assert.ok(taken, '取走执行要广播 taken');
+  assert.equal(taken.mode, 'steer');
+  assert.ok(taken.id, 'taken 事件要带条目 id（界面据此把排队条摘掉）');
+
+  // 落盘：插话成了会话里的用户消息（刷新后仍在）
+  const sess = await api('GET', `/api/session/${sessionId}`);
+  const msgs = sess.json.session.msgs;
+  const steerMsg = msgs.find((m) => m.role === 'user' && m.steer);
+  assert.ok(steerMsg, '插话要落成会话消息');
+  assert.equal(steerMsg.content, '插一句：注意格式');
+
+  await ac.abort();
+  await reader;
+});
+
+test('端到端：打断（urgent）掐掉当前模型调用，新指令插到最前', async () => {
+  const ac = new AbortController();
+  const events = [];
+  const reader = (async () => {
+    const res = await fetch(`${base}/api/events`, { signal: ac.signal });
+    let buf = '';
+    for await (const chunk of res.body) {
+      buf += Buffer.from(chunk).toString('utf8');
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const line = block.split('\n').find((l) => l.startsWith('data: '));
+        if (line) events.push(JSON.parse(line.slice(6)));
+      }
+    }
+  })().catch(() => {});
+
+  const first = await api('POST', '/api/chat', { text: '慢任务：请慢慢想很久' });
+  const { runId, sessionId } = first.json;
+  await waitFor(() => events.some((e) => e.type === 'content' && e.runId === runId), { what: '慢任务开始出字', timeout: 10_000 });
+
+  // 打断：掐掉当前调用（不等它吐完 30 片 ≈ 3.6s）
   const t0 = Date.now();
   const second = await api('POST', '/api/chat', { sessionId, text: '改做这个：立刻回答', mode: 'urgent' });
-  assert.equal(second.status, 200);
   assert.equal(second.json.steered, true);
   assert.equal(second.json.mode, 'urgent');
   assert.equal(second.json.runId, runId, '打断不换运行，还是同一段');
@@ -388,25 +474,68 @@ test('端到端：立即执行（urgent）打断当前模型调用，新指令�
   assert.equal(done.status, 'ok');
   assert.ok(elapsed < 3000, `应当很快收尾（实际 ${elapsed}ms）—— 慢流要 3.6s 才吐完`);
 
-  // steer 事件两态：入队时广播 queued（多观察者都能看到队列），被取走时广播 taken
   const steers = events.filter((e) => e.type === 'steer' && e.runId === runId);
-  assert.ok(steers.some((e) => e.state === 'queued'), '入队要广播 queued（别的设备才看得到队列）');
   const taken = steers.find((e) => e.state === 'taken');
   assert.ok(taken, '取走执行要广播 taken');
   assert.equal(taken.mode, 'urgent');
-  assert.ok(taken.id, 'taken 事件要带条目 id（界面据此把排队条摘掉）');
 
-  // 落盘：插话成了会话里的用户消息（刷新后仍在），且最终回答来自新指令
-  const sess = await api('GET', `/api/session/${sessionId}`);
-  const msgs = sess.json.session.msgs;
+  const msgs = (await api('GET', `/api/session/${sessionId}`)).json.session.msgs;
   const steerMsg = msgs.find((m) => m.role === 'user' && m.steer);
-  assert.ok(steerMsg, '插话要落成会话消息');
-  assert.equal(steerMsg.content, '改做这个：立刻回答');
-  // 正文现在是"所有轮的叙述拼起来"（被打断的那半句 + 新指令的回答），所以要 contains 而不是相等
+  assert.equal(steerMsg?.content, '改做这个：立刻回答', '插话要落成会话消息');
   assert.match(msgs.at(-1).content, /收到新指令，已停下手上的事。$/, '新指令的回答在最后');
 
   await ac.abort();
   await reader;
+});
+
+test('端到端：文件改动（结构化 diff：行号 + 增删 + 逐行内容）', async () => {
+  const root = path.join(TMP, 'diff-proj');
+  fs.mkdirSync(root, { recursive: true });
+  const pid = (await api('POST', '/api/projects', { root, name: 'diff 项目' })).json.project.id;
+  const sid = (await api('POST', '/api/sessions', { projectId: pid })).json.session.id;
+
+  /* 造出一次真实改动：先写一个已有文件，再让假上游 write_file 覆盖它 ——
+     这样 diff 里既有删除也有新增，行号两侧都能验到（新建文件的 hunk 只有一侧）。 */
+  fs.mkdirSync(path.join(root, 'out'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'out', 'note.txt'), '旧内容\n', 'utf8');
+
+  const chat = await api('POST', '/api/chat', { sessionId: sid, text: '写文件' });
+  assert.equal(chat.status, 200);
+  await waitFor(async () => {
+    const s = await api('GET', `/api/session/${sid}`);
+    const last = s.json.session.msgs.at(-1);
+    return last?.role === 'assistant' && last.stats ? last : null;
+  }, { what: '运行收尾', timeout: 30_000 });
+
+  const list = (await api('GET', `/api/session/${sid}`)).json.changes;
+  assert.ok(list.length, '改文件后要有检查点');
+
+  /* 检查点列表是"动手前"的快照，最新那条之后才是真正的改动 —— 逐条试到有 diff 的为止。 */
+  let files = [];
+  let diffText = '';
+  for (const cp of list) {
+    const d = await api('GET', `/api/changes/diff?sessionId=${sid}&checkpoint=${cp.id}`);
+    if ((d.json.files ?? []).length) {
+      files = d.json.files;
+      diffText = d.json.text;
+      break;
+    }
+  }
+  assert.ok(files.length, '至少要有一条检查点能算出文件差异');
+  const f = files.find((x) => x.path.includes('note.txt')) ?? files[0];
+  assert.ok(typeof f.path === 'string' && f.path.length, '文件路径');
+  assert.ok(Array.isArray(f.lines), '逐行数据');
+  const added = f.lines.filter((l) => l.kind === 'add');
+  const dels = f.lines.filter((l) => l.kind === 'del');
+  assert.ok(added.length, '应有新增行');
+  assert.ok(added.every((l) => l.newNo !== null && l.oldNo === null), '新增行只有新行号');
+  assert.ok(added.every((l) => l.newNo >= 1), `行号从 1 起（实际 ${added.map((l) => l.newNo).join(',')}）`);
+  assert.equal(f.added, added.length, 'added 计数与逐行数据一致');
+  assert.equal(f.removed, dels.length, 'removed 计数与逐行数据一致');
+  assert.ok(f.lines.some((l) => l.text.includes('你好')), '逐行内容带原文');
+  assert.ok(!f.lines.some((l) => l.kind === 'ctx' && l.text === '' && l.newNo === 0), '不该出现行号 0 的假上下文行');
+  // 纯文本仍然返回（命令行工具与"复制"用）
+  assert.match(diffText, /^diff --git /m, 'text 仍是统一 diff 文本');
 });
 
 test('端到端：多会话并发各自跑完（互不阻塞、互不串数据）', async () => {
@@ -434,6 +563,33 @@ test('端到端：多会话并发各自跑完（互不阻塞、互不串数据�
   assert.match(sb.json.session.msgs[0].content, /会话 B/);
   assert.equal(sa.json.session.msgs.length, 2);
   assert.equal(sb.json.session.msgs.length, 2);
+});
+
+test('端到端：子智能体可续谈（spawn → 结论 → 父体再问它一句）', async () => {
+  const proj = await api('POST', '/api/projects', { root: PROJECT_DIR, name: '子体项目' });
+  const chat = await api('POST', '/api/chat', { text: '请你用子智能体帮我调查一件事', projectId: proj.json.project.id });
+  assert.equal(chat.status, 200, JSON.stringify(chat.json));
+  const { sessionId } = chat.json;
+
+  const readDone = async () => {
+    const s = await api('GET', `/api/session/${sessionId}`);
+    const last = s.json.session.msgs.at(-1);
+    if (!last?.stats) return null;
+    const call = (last.calls ?? []).find((c) => c.name === 'spawn_agent');
+    return call ? { call, content: last.content } : null;
+  };
+  const done = await waitFor(readDone, { what: '父运行跑完（含 spawn_agent）', timeout: 30_000 });
+  assert.ok(done.call.state === 'ok', 'spawn_agent 应成功');
+
+  // 父消息里记了 spawn_agent 调用；它的完整结果（含子体结论）按需取
+  const sess = (await api('GET', `/api/session/${sessionId}`)).json.session;
+  const lastMsg = sess.msgs.at(-1);
+  const agentCall = lastMsg.calls.find((c) => c.name === 'spawn_agent');
+  assert.ok(agentCall, '应有 spawn_agent 调用记录');
+  const detail = await api('GET', `/api/run/${lastMsg.runId}/call/${agentCall.seq}`);
+  assert.equal(detail.status, 200, 'spawn_agent 的完整结果应可取出');
+  assert.match(detail.json.text, /子智能体/, '结果里应有子体的汇报');
+  assert.ok(detail.json.pluginId === 'subagent', '这条调用归 subagent 插件');
 });
 
 test('端到端：运行中再发消息 = 插话（不打断当前运行）', async () => {
@@ -527,7 +683,7 @@ test('上游鲁棒性：工具参数连续被截断会及时收手（不再烧�
 });
 
 test('上游鲁棒性：停滞看门狗（连上不吐字）——识别为停滞并重试，不是"用户取消"', async () => {
-  await api('POST', '/api/settings', { params: { stallSec: 1 } });
+  await api('POST', '/api/settings', { system: { stallSec: 1 } });
   const chat = await api('POST', '/api/chat', { text: '故障:stall 问一句' });
   const { sessionId } = chat.json;
   const done = await waitFor(async () => {
@@ -537,7 +693,7 @@ test('上游鲁棒性：停滞看门狗（连上不吐字）——识别为停�
   }, { what: '运行收尾', timeout: 60_000 });
   assert.match(String(done.error ?? ''), /停滞/, '要报"停滞"（说明看门狗认领了它）');
   assert.doesNotMatch(String(done.error ?? ''), /请求已取消/, '不该误判成用户取消');
-  await api('POST', '/api/settings', { params: { stallSec: 90 } }); // 复原，别影响别的用例
+  await api('POST', '/api/settings', { system: { stallSec: 90 } }); // 复原，别影响别的用例
 });
 
 test('端到端：归档项目返回的是**活跃**会话列表（侧栏那份），不是归档列表', async () => {
@@ -564,36 +720,56 @@ test('端到端：归档项目返回的是**活跃**会话列表（侧栏那份�
   assert.ok(ids2.includes(sA) && ids2.includes(sB), '恢复后它们回到活跃列表');
 });
 
-test('端到端：排队队列（入队 → 查看 → 删除），排队不进会话消息', async () => {
+test('端到端：运行中发消息**默认排队**（当前这一段跑完后自动执行）；显式 steer 才在当前轮次内生效', async () => {
   const first = await api('POST', '/api/chat', { text: '超慢任务：这一轮会跑很久' });
   assert.equal(first.status, 200);
   const sid = first.json.sessionId;
 
-  // 运行中再发 = 入队（不再直接插进对话）
-  const q = await api('POST', '/api/chat', { sessionId: sid, text: '排队中的补充说明' });
+  /* 默认（**不传 mode**）= 排队：排在这一段运行之后自动执行（系统参数 queueDefault 默认 queue）。
+     这是"运行中再发一句"的常规行为 —— 不插队，先把手上的事做完。 */
+  const q = await api('POST', '/api/chat', { sessionId: sid, text: '默认排队的补充说明' });
   assert.equal(q.json.steered, true);
-  assert.equal(q.json.mode, 'steer');
+  assert.equal(q.json.mode, 'queue', '不传 mode 时默认应为 queue（这一段跑完自动执行）');
   assert.ok(q.json.item?.id, '入队要返回条目 id（界面才能单独删除/立即执行）');
 
   const list = await api('GET', `/api/run/queue?sessionId=${sid}`);
-  assert.equal(list.status, 200);
   assert.deepEqual(list.json.items.map((i) => i.id), [q.json.item.id]);
 
   // 还没执行 → 会话里不该有它
   const sess = await api('GET', `/api/session/${sid}`);
-  assert.ok(!sess.json.session.msgs.some((m) => m.content === '排队中的补充说明'), '排队的消息不该进会话');
+  assert.ok(!sess.json.session.msgs.some((m) => m.content === '默认排队的补充说明'), '排队的消息不该进会话');
 
   // 删除
   const del = await api('POST', '/api/run/queue', { sessionId: sid, id: q.json.item.id, action: 'remove' });
   assert.equal(del.json.ok, true);
   assert.deepEqual(del.json.items, [], '删完队列应为空');
+
+  /* 对比：显式 steer 才是"注入当前运行"，会被安全点取走（taken），不进 flushQueue 的那条路。 */
+  const s2 = await api('POST', '/api/chat', { sessionId: sid, text: '插话：这条要在同一段里生效', mode: 'steer' });
+  assert.equal(s2.json.mode, 'steer');
+  assert.equal(s2.json.runId, first.json.runId, '插话不换运行');
 });
 
-test('端到端：运行结束时把排队中的消息接着执行（不会永远挂着）', async () => {
+test('端到端：系统参数 queueDefault 可改默认语义（改成 steer 后不传 mode 即为插话）', async () => {
+  const first = await api('POST', '/api/chat', { text: '超慢任务：这一轮会跑很久' });
+  const sid = first.json.sessionId;
+
+  // 改成 steer 后，不传 mode 的默认语义应当跟着变
+  await api('POST', '/api/settings', { system: { queueDefault: 'steer' } });
+  try {
+    const s = await api('POST', '/api/chat', { sessionId: sid, text: '默认改成插话' });
+    assert.equal(s.json.mode, 'steer', 'queueDefault=steer 时不传 mode 应走插话');
+    assert.equal(s.json.runId, first.json.runId, '插话不换运行');
+  } finally {
+    await api('POST', '/api/settings', { system: { queueDefault: 'queue' } }); // 复原，别影响别的用例
+  }
+});
+
+test('端到端：运行结束时把排队（queue）中的消息接着执行（不会永远挂着）', async () => {
   const first = await api('POST', '/api/chat', { text: '慢任务：慢慢想很久' });
   const sid = first.json.sessionId;
   const queued = '排队的话，这一轮跑完再执行';
-  const q = await api('POST', '/api/chat', { sessionId: sid, text: queued });
+  const q = await api('POST', '/api/chat', { sessionId: sid, text: queued, mode: 'queue' });
   assert.equal(q.json.steered, true);
 
   const msgs = await waitFor(async () => {
@@ -606,10 +782,10 @@ test('端到端：运行结束时把排队中的消息接着执行（不会永�
   assert.ok(msgs.some((m) => m.content === queued), '排队的消息最终以正常用户消息落进会话');
 });
 
-test('端到端：队内「立即执行」打断当前调用并插到最前', async () => {
+test('端到端：队内「立即执行」掐掉当前调用并插到最前', async () => {
   const first = await api('POST', '/api/chat', { text: '超慢任务：这一轮会跑很久' });
   const sid = first.json.sessionId;
-  const q = await api('POST', '/api/chat', { sessionId: sid, text: '改做这个：立刻回答' });
+  const q = await api('POST', '/api/chat', { sessionId: sid, text: '改做这个：立刻回答', mode: 'queue' });
   assert.equal(q.json.steered, true);
 
   const t0 = Date.now();

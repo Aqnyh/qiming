@@ -10,6 +10,10 @@
  *
  * 滚动：这一栏自己滚（min-h-0 + overflow-y-auto），消息区滚动不会带动它（需求 7）。
  * 窄屏（<md）时整栏变成抽屉：顶栏的汉堡键开合，选中会话后自动收起。
+ *
+ * 手机（<md）三处专门适配（2026-10-10）：抽屉不占满整屏（留一条能看到消息区的边，
+ * 随时能点一下收回去）、顶部让开刘海（safe-area-inset-top）、行内的置顶/归档按钮
+ * 常显（触屏没有 hover，见 styles.css 的 pointer:coarse 段）。
  */
 import { useState } from 'react';
 import { useApp } from '../state/store.js';
@@ -41,7 +45,7 @@ function groupSessions(sessions, projects) {
   return out.sort((a, b) => Number(b.pinned) - Number(a.pinned));
 }
 
-/** 行内小按钮（悬停才出现，避免把列表挤满） */
+/** 行内小按钮（悬停才出现；手机上由 styles.css 的 pointer:coarse 强制常显） */
 function RowBtn({ icon, title, onClick }) {
   return (
     <button
@@ -51,7 +55,7 @@ function RowBtn({ icon, title, onClick }) {
         e.stopPropagation();
         onClick();
       }}
-      className="hidden shrink-0 rounded p-0.5 text-subtle hover:bg-raise hover:text-fg group-hover:block"
+      className="row-btn hidden shrink-0 rounded p-0.5 text-subtle hover:bg-raise hover:text-fg group-hover:block"
     >
       <Icon name={icon} className="size-3" />
     </button>
@@ -69,7 +73,7 @@ export default function Sidebar() {
       {/* 窄屏遮罩 */}
       {open ? <div className="fixed inset-0 z-30 bg-black/50 md:hidden" onClick={closeSidebar} /> : null}
       <aside
-        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-line bg-panel transition-transform md:static md:z-auto md:w-64 md:translate-x-0 ${open ? 'translate-x-0' : '-translate-x-full'}`}
+        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-line bg-panel pt-[env(safe-area-inset-top)] transition-transform md:static md:z-auto md:w-64 md:translate-x-0 md:pt-0 max-md:w-[86vw] ${open ? 'translate-x-0' : '-translate-x-full'}`}
       >
         {/* 品牌行：高度与顶栏一致（h-14），于是两边的下边框在同一条线上（需求 3） */}
         <div className="flex h-14 shrink-0 items-center gap-2 border-b border-line px-3">
@@ -81,13 +85,13 @@ export default function Sidebar() {
             <span className="block truncate text-[10.5px] text-subtle">本机智能体</span>
           </span>
           <span className="flex-1" />
-          <Btn variant="ghost" size="icon" onClick={closeSidebar} className="md:hidden" title="收起">
+          <Btn variant="ghost" size="icon" onClick={closeSidebar} className="md:hidden max-md:h-10 max-md:w-10" title="收起" aria-label="收起会话列表">
             <Icon name="close" className="size-4" />
           </Btn>
 
           {/* 「+」：先选项目，再在该项目下建一条新会话（需求 4） */}
           <div className="relative">
-            <Btn variant="ghost" size="icon" onClick={() => setPicker((v) => !v)} title="新建会话（先选项目）">
+            <Btn variant="ghost" size="icon" onClick={() => setPicker((v) => !v)} title="新建会话（先选项目）" className="max-md:h-10 max-md:w-10">
               <Icon name="plus" className="size-4" />
             </Btn>
             {picker ? (
@@ -173,7 +177,7 @@ export default function Sidebar() {
                       {running ? <Spinner className="size-3 shrink-0 text-accent" /> : null}
                       {s.pinned && !running ? <Icon name="pin" className="size-3 shrink-0 text-accent" /> : null}
                       <span className={`min-w-0 flex-1 truncate text-xs ${active ? 'text-fg' : 'text-fg/90'}`}>{s.title || '新会话'}</span>
-                      <span className="shrink-0 text-[10px] tabular-nums text-subtle group-hover:hidden">{fmtWhen(s.updatedAt || s.ts)}</span>
+                      <span className="row-when shrink-0 text-[10px] tabular-nums text-subtle group-hover:hidden">{fmtWhen(s.updatedAt || s.ts)}</span>
                       <RowBtn icon="pin" title={s.pinned ? '取消置顶' : '置顶'} onClick={() => void pinSession(s.id, !s.pinned)} />
                       <RowBtn icon="archive" title="归档（可在「设置 → 归档」恢复）" onClick={() => void archiveSession(s.id, true)} />
                     </div>

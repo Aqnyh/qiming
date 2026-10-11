@@ -198,13 +198,12 @@ function CallMedia({ media }) {
 /**
  * 用户消息气泡。插话（steer）**不在这里渲染**（见 ChatView 注释：由浅文字提示呈现）。
  */
-export function SteerBubble({ msg }) {
+export function UserBubble({ msg }) {
   return (
     <div className="my-3 flex justify-end">
       <div className="max-w-[85%] rounded-2xl rounded-br-md border border-line bg-raise px-3.5 py-2">
         <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">{msg.content}</p>
         <div className="mt-1 flex items-center justify-end gap-1.5 text-[10.5px] text-subtle">
-          {msg.steer ? <Badge tone="warn">插话</Badge> : null}
           <span>{fmtWhen(msg.ts)}</span>
         </div>
       </div>
@@ -214,7 +213,7 @@ export function SteerBubble({ msg }) {
 
 function Message({ msg, streaming = false }) {
   const st = useApp();
-  if (msg.role === 'user') return <SteerBubble msg={msg} />;
+  if (msg.role === 'user') return <UserBubble msg={msg} />;
 
   const calls = Array.isArray(msg.calls) ? msg.calls : [];
   const notices = Array.isArray(msg.notices) ? msg.notices : [];
@@ -222,6 +221,9 @@ function Message({ msg, streaming = false }) {
      （附件不再一律堆在整段文本之后；见 ui/lib/message-parts.js） */
   const parts = buildParts(msg.content, calls);
   const stats = statsLine(msg.stats);
+  /* turn/step：turn = 用户输入划的段（插话/打断开新 turn），step = 段内模型调用序号。
+     只在有值时显示（老记录没有这两个字段）。 */
+  const turnStep = msg.turn ? `turn ${msg.turn}${msg.step ? ` · step ${msg.step}` : ''}` : '';
 
   return (
     <div className="group/msg my-3">
@@ -260,7 +262,7 @@ function Message({ msg, streaming = false }) {
 
         {stats || calls.length ? (
           <p className="mt-1.5 text-[10.5px] tabular-nums text-subtle">
-            {[stats, calls.length ? `操作 ${calls.length} 次` : ''].filter(Boolean).join(' · ')}
+            {[turnStep, stats, calls.length ? `操作 ${calls.length} 次` : ''].filter(Boolean).join(' · ')}
           </p>
         ) : null}
       </div>

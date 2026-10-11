@@ -103,6 +103,79 @@ test('技能：写入 / 读取 / 目录 / 导入 / 停用 / 删除', () => {
   assert.equal(skills.read('pdf-split'), null);
 });
 
+/* ────────────────────────── 轮次上限 ────────────────────────── */
+
+test('轮次上限：用户设多少就是多少（没有 200 那种静默封顶）', async () => {
+  const { resolveMainRounds, resolveSubRounds, DEFAULT_SUB_ROUNDS } = await import('../src/agent/rounds.ts');
+
+  // 0 / 空 / 负数 / 非数字 = 没设 → 自动（各插件额度汇总 + 2）
+  for (const unset of [0, undefined, null, '', -5, NaN, 'abc']) {
+    assert.equal(resolveMainRounds(unset, 1212), 1214, `${String(unset)} 应当走自动`);
+  }
+  assert.equal(resolveMainRounds(0, 0), 2, '自动至少留 2 轮（免得一个插件都没启用时立刻撞顶）');
+
+  // 设了就照做：小的照做，**大的也照做**（旧实现会静默封到 200，界面显示 300 却只跑 200）
+  assert.equal(resolveMainRounds(3, 1212), 3);
+  assert.equal(resolveMainRounds(300, 0), 300);
+  assert.equal(resolveMainRounds(10_000, 0), 10_000);
+  assert.equal(resolveMainRounds(3.9, 0), 3, '取整，不四舍五入到 4');
+
+  // 子智能体：工具入参 > 插件参数 > 内置 12（子智能体预算归**插件参数**，见 2026-10-10 第十一轮归一）
+  assert.equal(resolveSubRounds({ hint: 30, pluginParam: 10 }), 30);
+  assert.equal(resolveSubRounds({ pluginParam: 10 }), 10);
+  assert.equal(resolveSubRounds({}), DEFAULT_SUB_ROUNDS);
+  assert.equal(resolveSubRounds({ pluginParam: 999 }), 999, '同样不封顶');
+  assert.equal(resolveSubRounds({ pluginParam: 0 }), DEFAULT_SUB_ROUNDS, '填 0 = 没设，不是"不许跑"');
+  assert.equal(resolveSubRounds({ hint: 1 }), 2, '下限 2：至少"调一次工具 + 汇报一次"');
+});
+
+/* ────────────────────────── 设置归一：模型参数 vs 系统参数 ────────────────────────── */
+
+test('设置：旧版扁平 params 里的系统参数无损迁到 system，params 只留模型调用参数', async () => {
+  const { normalize } = await import('../src/store/settings.ts');
+
+  // 模拟旧存档：maxRounds/spill*/stallSec/subagentMaxRounds 都挤在 params 里
+  const legacy = {
+    version: 1,
+    providers: [],
+    activeId: null,
+    params: {
+      temperature: 0.3,
+      maxTokens: 4096,
+      maxRounds: 500,
+      stallSec: 30,
+      spillMaxChars: 12000,
+      subagentMaxRounds: 20,
+    },
+    workspace: '/tmp',
+    ui: {},
+    updatedAt: 0,
+  };
+  const s = normalize(legacy);
+
+  // 迁到 system：值原样搬过来
+  assert.equal(s.system.maxRounds, 500, '轮次上限迁到 system');
+  assert.equal(s.system.stallSec, 30, '停滞看门狗迁到 system');
+  assert.equal(s.system.spillMaxChars, 12000, 'spill 阈值迁到 system');
+
+  // params 只剩模型调用参数，且不含被迁走的键
+  assert.equal(s.params.temperature, 0.3);
+  assert.equal(s.params.maxTokens, 4096);
+  assert.equal(s.params.maxRounds, undefined, 'params 里不该再有 maxRounds');
+  assert.equal(s.params.spillMaxChars, undefined, 'params 里不该再有 spillMaxChars');
+
+  // 缺省值补齐（没迁到的系统参数用默认）
+  assert.equal(s.system.maxRuns, 8, '并发上限默认 8');
+  assert.equal(s.system.queueDefault, 'queue', '排队默认 = queue（运行中再发一句先排队）');
+  assert.equal(s.system.checkpointLimit, 200, '检查点列表默认窗口 200');
+
+  // 新存档（已经分好 params/system）保持原样
+  const already = normalize({ version: 2, params: { temperature: 0.9 }, system: { maxRuns: 0, queueDefault: 'steer' } });
+  assert.equal(already.params.temperature, 0.9);
+  assert.equal(already.system.maxRuns, 0, 'system 里已有的值优先');
+  assert.equal(already.system.queueDefault, 'steer');
+});
+
 /* ────────────────────────── 插件登记表 ────────────────────────── */
 
 test('插件：默认启用、参数可改、停用后工具消失、提示词走注册中心', () => {
@@ -416,6 +489,221 @@ process.stderr.write('fake mcp started\\n');
     return true;
   });
   dead.stop();
+});
+
+/* ────────────────────────── 文件改动（检查点） ────────────────────────── */
+
+test('检查点：改动的比对与撤回（含"新建的文件要能撤回掉"）', async () => {
+  const { repoFor } = await import('../src/store/checkpoints.ts');
+  const proj = path.join(TMP, 'ck-proj');
+  fs.mkdirSync(proj, { recursive: true });
+  const a = path.join(proj, 'a.txt');
+  const n = path.join(proj, 'new.txt');
+  const repo = repoFor('ck-test', proj);
+  assert.ok(repo, '检查点仓库要能建起来');
+
+  /* 真实调用顺序：**先打快照（记"动手前"），再落盘**（fs 插件就是这么调的） */
+  await repo.snapshot('write_file a.txt', [a]);
+  fs.writeFileSync(a, 'one\n', 'utf8');
+  const editCp = await repo.snapshot('edit_file a.txt', [a]);
+  fs.writeFileSync(a, 'one\ntwo\n', 'utf8');
+
+  const list = await repo.list();
+  assert.ok(list.length >= 2, '每次改动前都该留下一笔检查点');
+  const shown = await repo.show(editCp.id);
+  assert.equal(shown.stat.list[0]?.path, 'a.txt');
+  assert.ok(shown.text.includes('+two'), 'diff 里要能看到这次改动加的行');
+
+  /* 新建文件：快照时文件还不存在（没有内容变化），但"动过的路径"必须记住 ——
+     否则新建出来的未跟踪文件在 diff/撤回里完全看不见（最常见的新建场景会失效）。 */
+  await repo.snapshot('write_file new.txt', [n]);
+  fs.writeFileSync(n, 'brand new\n', 'utf8');
+  const afterNew = await repo.show((await repo.list())[0].id);
+  assert.deepEqual(afterNew.stat.list.map((x) => x.path), ['new.txt'], '新建的文件要出现在改动里');
+  assert.ok(afterNew.text.includes('+brand new'));
+
+  // 撤回到 edit_file 那一笔：a.txt 要还原，new.txt（之后新建的）要被删掉
+  const before = (await repo.list()).length;
+  const r = await repo.restore(editCp.id);
+  assert.equal(r.ok, true, r.detail);
+  assert.equal(fs.existsSync(n), false, '快照之后新建的文件要被移除');
+  assert.equal(fs.readFileSync(a, 'utf8'), 'one\n', '改过的文件要回到动手前');
+
+  // 撤回本身也留痕（历史只增不减，可以再撤回来）
+  assert.ok((await repo.list()).length > before, '撤回会记一笔新检查点，而不是把历史截断');
+});
+
+test('检查点：不做全树扫描（cwd 是家目录时也不能卡住）', async () => {
+  const { repoFor } = await import('../src/store/checkpoints.ts');
+  const home = os.homedir();
+  const repo = repoFor('ck-home-test', home);
+  const target = path.join(home, `.qiming-test-${Date.now()}.txt`);
+  const t0 = Date.now();
+  await repo.snapshot('write_file（家目录）', [target]);
+  fs.writeFileSync(target, 'x\n', 'utf8');
+  const ms = Date.now() - t0;
+  /* 曾经的 bug：快照里 `git add -A .` 会把家目录几十万个文件 stat 一遍，
+     一次写文件就能卡几十秒，整个循环跟着停摆。只按"被改动的路径"入索引就不会。 */
+  assert.ok(ms < 3000, `家目录里打快照应远快于 3s（实际 ${ms}ms）`);
+  fs.rmSync(target, { force: true });
+});
+
+test('检查点：没有路径范围时跳过，而不是退化成全树扫描', async () => {
+  const { repoFor } = await import('../src/store/checkpoints.ts');
+  const proj = path.join(TMP, 'ck-empty');
+  fs.mkdirSync(proj, { recursive: true });
+  const repo = repoFor('ck-empty-test', proj);
+  // 一条全新的会话、空仓库、不传任何路径 → 没有任何可依据的范围
+  const cp = await repo.snapshot('系统快照', []);
+  assert.equal(cp, null, '没有范围就跳过（宁可少记一笔，也不扫全树）');
+});
+
+/* ────────────────────────── 工具结果落盘（spill） ────────────────────────── */
+
+test('spill：短结果原样返回，不落盘', async () => {
+  const { maybeSpill, DEFAULT_SPILL, spillConfigFrom } = await import('../src/agent/spill.ts');
+  const cfg = spillConfigFrom({});
+  assert.equal(cfg.enabled, true);
+  assert.equal(cfg.maxChars, DEFAULT_SPILL.maxChars);
+  const r = maybeSpill(spillConfigFrom({}), { runId: 'r1', seq: 1, name: 'read_file' }, 'short');
+  assert.equal(r.text, 'short');
+  assert.equal(r.path, undefined, '短结果不该落盘');
+});
+
+test('spill：超长结果落盘，回灌的是头尾预览 + 可 read_file 的路径', async () => {
+  const { maybeSpill } = await import('../src/agent/spill.ts');
+  const cfg = { enabled: true, maxChars: 100, headChars: 20, tailChars: 20 };
+  const body = 'HEAD' + 'x'.repeat(300) + 'TAIL';
+  const r = maybeSpill(cfg, { runId: 'run-spill', seq: 7, name: 'run_command' }, body);
+  assert.ok(r.path, '应落盘并给出路径');
+  assert.ok(r.path.includes('spills'), `路径在 spills 目录下：${r.path}`);
+  assert.equal(fs.readFileSync(r.path, 'utf8'), body, '落盘的是完整正文');
+  assert.ok(r.text.includes('HEAD'), '预览保留开头');
+  assert.ok(r.text.includes('TAIL'), '预览保留结尾');
+  assert.ok(r.text.includes('read_file'), '预览里告诉模型怎么取细节');
+  assert.ok(r.text.length < body.length, '回灌文本明显短于原文');
+});
+
+test('spill：关掉或阈值 0 时永远内联（不落盘）', async () => {
+  const { maybeSpill, spillConfigFrom } = await import('../src/agent/spill.ts');
+  const body = 'y'.repeat(10_000);
+  assert.equal(spillConfigFrom({ spillEnabled: false }).enabled, false);
+  assert.equal(spillConfigFrom({ spillMaxChars: 0 }).enabled, false);
+  assert.equal(maybeSpill(spillConfigFrom({ spillEnabled: false }), { runId: 'r', seq: 1, name: 't' }, body).path, undefined);
+  assert.equal(maybeSpill(spillConfigFrom({ spillMaxChars: 0 }), { runId: 'r', seq: 1, name: 't' }, body).path, undefined);
+});
+
+/* ────────────────────────── 工具结果错误码 ────────────────────────── */
+
+test('错误码：ok=false 未给码时归一为 EXEC_FAILED，给码则保留', async () => {
+  const { normalizeToolResult } = await import('../src/agent/tools.ts');
+  const a = normalizeToolResult({ ok: false, text: 'x' });
+  assert.equal(a.errorCode, 'EXEC_FAILED');
+  const b = normalizeToolResult({ ok: false, text: 'x', errorCode: 'NOT_FOUND' });
+  assert.equal(b.errorCode, 'NOT_FOUND');
+  const c = normalizeToolResult({ ok: true, text: 'x' });
+  assert.equal(c.errorCode, undefined, '成功结果不该有错误码');
+});
+
+/* ────────────────────────── 压缩：替换节点 ────────────────────────── */
+
+test('压缩：旧单节点形态归一化为 nodes，且请求视图替换掉被遮蔽区间', async () => {
+  const { normalizeCompact, viewMessages } = await import('../src/agent/context.ts');
+  const legacy = normalizeCompact({ upTo: 3, count: 3, text: '旧摘要', ts: 1 });
+  assert.deepEqual(legacy.nodes.map((n) => [n.from, n.to]), [[0, 3]]);
+
+  const messages = [
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: 'b' },
+    { role: 'user', content: 'c' },
+    { role: 'assistant', content: 'd' },
+  ];
+  const view = viewMessages({ messages, compact: legacy, compactHeader: 'H', overheadTokens: 0, ctxLimit: 0 });
+  assert.equal(view.length, 3, '两条摘要消息 + 未遮蔽的 d');
+  assert.ok(view[0].content.includes('旧摘要'));
+  assert.equal(view[2].content, 'd', '遮蔽区间之外的原消息保留');
+});
+
+test('压缩：多个节点可叠加，各自替换自己的区间（互不覆盖）', async () => {
+  const { viewMessages } = await import('../src/agent/context.ts');
+  const messages = Array.from({ length: 6 }, (_, i) => ({ role: 'user', content: `m${i}` }));
+  const compact = {
+    nodes: [
+      { id: 'n1', from: 0, to: 2, text: 'S1', ts: 1 },
+      { id: 'n2', from: 2, to: 4, text: 'S2', ts: 2 },
+    ],
+  };
+  const view = viewMessages({ messages, compact, compactHeader: 'H', overheadTokens: 0, ctxLimit: 0 });
+  const texts = view.map((m) => m.content);
+  assert.ok(texts.some((t) => t.includes('S1')), '第一段摘要');
+  assert.ok(texts.some((t) => t.includes('S2')), '第二段摘要');
+  assert.equal(texts[texts.length - 1], 'm5', '未遮蔽的尾部保留');
+});
+
+test('压缩：compactRange 从已有节点之后继续，不重复压同一段', async () => {
+  const { compactRange } = await import('../src/agent/context.ts');
+  const messages = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: `m${i}` }));
+  const first = compactRange(messages, 4, null);
+  assert.deepEqual(first, { from: 0, to: 16 });
+  const second = compactRange(messages, 4, { nodes: [{ id: 'n1', from: 0, to: 16, text: 'x', ts: 1 }] });
+  assert.equal(second, null, '已遮蔽区间不再重复压缩（余下不足阈值）');
+});
+
+/* ────────────────────────── 会话事件日志（append-only 真源） ────────────────────────── */
+
+test('会话日志：append/insert/replace 派生出的消息序列正确', async () => {
+  const log = await import('../src/store/session-log.ts');
+  const L = [];
+  log.appendMsg(L, { id: 'm1', role: 'user', content: 'a', ts: 1 });
+  log.appendMsg(L, { id: 'm2', role: 'assistant', content: '占位', ts: 2 });
+  log.insertMsg(L, 'm2', { id: 'm3', role: 'user', content: '插话', ts: 3 });
+  log.replaceMsg(L, { id: 'm2', role: 'assistant', content: '定稿', ts: 4, stats: { in: 1, out: 2, ms: 3 } });
+  const msgs = log.deriveMessages(L);
+  assert.deepEqual(msgs.map((m) => m.id), ['m1', 'm3', 'm2']);
+  assert.equal(msgs.find((m) => m.id === 'm2').content, '定稿', 'replace 用定稿覆盖占位');
+  assert.equal(msgs.find((m) => m.id === 'm2').stats.out, 2);
+  assert.equal(L[L.length - 1].seq, 4, 'seq 自增，可用于审计');
+});
+
+test('会话日志：日志一旦写入，后续改原对象不影响已派生结果（不可变性）', async () => {
+  const log = await import('../src/store/session-log.ts');
+  const L = [];
+  const msg = { id: 'm1', role: 'user', content: '原始', ts: 1 };
+  log.appendMsg(L, msg);
+  msg.content = '事后被改'; // 事件记的是快照
+  assert.equal(log.deriveMessages(L)[0].content, '原始', '事件不可变：记的是当时的快照');
+});
+
+test('会话日志：旧存档（无 log）反向补成事件，重放结果与原来逐条一致', async () => {
+  const sessions = await import('../src/store/sessions.ts');
+  const legacy = {
+    id: 's_legacy',
+    title: '旧会话',
+    ts: 1,
+    updatedAt: 1,
+    projectId: null,
+    providerId: null,
+    model: 'm',
+    msgs: [
+      { id: 'a', role: 'user', content: '你好', ts: 1 },
+      { id: 'b', role: 'assistant', content: '在的', ts: 2 },
+    ],
+    compact: { upTo: 1, count: 1, text: '旧摘要', ts: 5 },
+  };
+  const norm = sessions.normalizeSession(legacy);
+  assert.ok(Array.isArray(norm.log) && norm.log.length === 3, '补齐 2 条消息事件 + 1 条压缩节点事件');
+  assert.deepEqual(norm.msgs.map((m) => [m.id, m.content]), [['a', '你好'], ['b', '在的']], '不改历史');
+  assert.deepEqual(norm.compact.nodes.map((n) => [n.from, n.to]), [[0, 1]], '旧压缩节点也被补进日志');
+});
+
+test('会话日志：删除压缩节点的事件能正确重放（撤回）', async () => {
+  const log = await import('../src/store/session-log.ts');
+  const L = [];
+  log.addCompactNode(L, { id: 'c1', from: 0, to: 3, text: 'S1', ts: 1 });
+  log.addCompactNode(L, { id: 'c2', from: 3, to: 5, text: 'S2', ts: 2 });
+  assert.equal(log.deriveCompact(L).length, 2);
+  log.removeCompactNodeById(L, 'c1');
+  assert.deepEqual(log.deriveCompact(L).map((n) => n.id), ['c2'], '撤掉的节点不再出现在派生结果里');
 });
 
 /* ────────────────────────── 存储 ────────────────────────── */

@@ -43,6 +43,15 @@ export function projectMemoryDir(id: string): string {
 export function runDir(runId: string): string {
   return path.join(RUNS_DIR, runId);
 }
+/**
+ * 超长工具结果的落盘目录（spill）。
+ *
+ * 为什么挂在运行目录下：spill 是"这次运行产生的原始记录"，与会话/运行同生命周期，
+ * 清理运行记录时一并带走；也便于按 (runId, seq) 定位。
+ */
+export function runSpillDir(runId: string): string {
+  return path.join(runDir(runId), 'spills');
+}
 export function skillDir(name: string): string {
   return path.join(SKILLS_DIR, name);
 }

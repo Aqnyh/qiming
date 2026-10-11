@@ -25,6 +25,8 @@ export type ExecutorDeps = {
   log: Logger;
   sudoPassword: () => string;
   runSubagent?: ToolRunCtx['runSubagent'];
+  /** 子智能体控制面（列表/续谈/中断）：运行宿主注入 */
+  subagents?: ToolRunCtx['subagents'];
   /** 文件改动的比对与撤回（影子 git）；没传就是不可用（工具会如实说明） */
   changes?: ToolRunCtx['changes'];
 };
@@ -36,6 +38,26 @@ export type ExecutionResult = {
   pluginId: string;
   ms: number;
 };
+
+/** 结果归一：补上默认值与标准错误码（ok=false 且没显式给码时，归类成 EXEC_FAILED） */
+export function normalizeToolResult(r: ToolResult): ToolResult {
+  const text = typeof r?.text === 'string' ? r.text : String(r?.text ?? '');
+  const ok = r?.ok !== false;
+  // 图片兜底：最多 4 张、单张 base64 ≤ 4MB（截图工具自己已经压过，这里是防手滑）
+  const images = (r?.images ?? []).filter((i) => i?.data && i.data.length <= 4 * 1024 * 1024).slice(0, 4);
+  return {
+    ok,
+    text: text || '（无输出）',
+    note: r?.note ?? firstLine(text),
+    lines: r?.lines,
+    files: r?.files,
+    media: r?.media,
+    spill: r?.spill,
+    ...(images.length ? { images } : {}),
+    ...(!ok ? { errorCode: r?.errorCode ?? 'EXEC_FAILED' } : {}),
+    refreshPrompt: r?.refreshPrompt,
+  };
+}
 
 export function createToolExecutor(deps: ExecutorDeps) {
   const used = new Map<string, number>();
@@ -50,7 +72,14 @@ export function createToolExecutor(deps: ExecutorDeps) {
     used.set(pluginId, (used.get(pluginId) ?? 0) + n);
   }
 
-  async function run(call: ToolCall, seq: number): Promise<ExecutionResult> {
+  /**
+   * 跑一个工具。
+   *
+   * `toolSignal` 是**这一个工具**的掐断把手（用户点「打断」时掐它）。
+   * 与 `deps.signal`（整段运行的中断，用户点「停止」）用 `AbortSignal.any` 合并：
+   * 工具只看一个 signal，任一触发都得停 —— 工具层不需要知道"是谁掐的"。
+   */
+  async function run(call: ToolCall, seq: number, toolSignal?: AbortSignal): Promise<ExecutionResult> {
     const started = Date.now();
     const tool = deps.plugins.toolByName(call.name);
     if (!tool) {
@@ -61,18 +90,20 @@ export function createToolExecutor(deps: ExecutorDeps) {
         ms: 0,
         result: {
           ok: false,
+          errorCode: 'UNKNOWN_TOOL',
           text: `${deps.prompts.text('loop.unknown_tool', { name: call.name })}\n当前可用工具：${known.join(', ')}`,
         },
       };
     }
     const pluginId = tool.pluginId;
+    const signal = toolSignal ? AbortSignal.any([deps.signal, toolSignal]) : deps.signal;
     const ctx: ToolRunCtx = {
       runId: deps.runId,
       sessionId: deps.sessionId,
       seq,
       cwd: deps.cwd,
       project: deps.project,
-      signal: deps.signal,
+      signal,
       param: (key) => deps.plugins.paramsOf(pluginId)[key],
       remaining: (key) => budgetOf(key),
       spend: (key, n) => spend(key, n),
@@ -80,37 +111,36 @@ export function createToolExecutor(deps: ExecutorDeps) {
       log: deps.log,
       sudoPassword: deps.sudoPassword,
       runSubagent: deps.runSubagent,
+      ...(deps.subagents ? { subagents: deps.subagents } : {}),
       ...(deps.changes ? { changes: deps.changes } : {}),
     };
     try {
       const result = await tool.run(call.args ?? {}, ctx);
-      return { tool, pluginId, ms: Date.now() - started, result: normalize(result) };
+      return { tool, pluginId, ms: Date.now() - started, result: normalizeToolResult(result) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       deps.log.warn(`工具 ${call.name} 抛错`, { msg });
+      /* 被掐断导致的抛错不能算"执行失败"：用户停止了运行/打断了这次调用，
+         结果是**未知**（可能已产生副作用）——标 TOOL_OUTCOME_UNKNOWN，免得界面把它
+         归进"失败率"里误导人（见 types.ts 的错误码说明）。 */
+      const aborted = signal.aborted;
       return {
         tool,
         pluginId,
         ms: Date.now() - started,
-        result: { ok: false, text: `工具 ${call.name} 执行失败：${msg}` },
+        result: {
+          ok: false,
+          errorCode: aborted ? 'TOOL_OUTCOME_UNKNOWN' : 'EXEC_FAILED',
+          text: aborted
+            ? `工具 ${call.name} 被中断，结果未知（可能已经产生部分副作用）。`
+            : `工具 ${call.name} 执行失败：${msg}`,
+        },
       };
     }
   }
 
   function normalize(r: ToolResult): ToolResult {
-    const text = typeof r?.text === 'string' ? r.text : String(r?.text ?? '');
-    // 图片兜底：最多 4 张、单张 base64 ≤ 4MB（截图工具自己已经压过，这里是防手滑）
-    const images = (r?.images ?? []).filter((i) => i?.data && i.data.length <= 4 * 1024 * 1024).slice(0, 4);
-    return {
-      ok: r?.ok !== false,
-      text: text || '（无输出）',
-      note: r?.note ?? firstLine(text),
-      lines: r?.lines,
-      files: r?.files,
-      media: r?.media,
-      ...(images.length ? { images } : {}),
-      refreshPrompt: r?.refreshPrompt,
-    };
+    return normalizeToolResult(r);
   }
 
   /** 工具表（给模型看的 schema）：名字 + 生效描述 + 参数 schema */

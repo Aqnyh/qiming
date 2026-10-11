@@ -13,11 +13,14 @@ import { chat as providerChat } from '../providers/index.ts';
 import type { ChatMessage, ProviderConfig } from '../providers/types.ts';
 import { runLoop } from '../agent/loop.ts';
 import type { LoopNotice } from '../agent/loop.ts';
+import { resolveMainRounds, resolveSubRounds } from '../agent/rounds.ts';
 import { createToolExecutor } from '../agent/tools.ts';
 import { assembleSystem } from '../agent/prompt.ts';
-import { collectText, compactRange, estimateMessages, needsCompaction, summarize, usageOf } from '../agent/context.ts';
+import { collectText, compactRange, estimateMessages, needsCompaction, normalizeCompact, summarize, usageOf } from '../agent/context.ts';
+import { addCompactNode, deriveCompact } from '../store/session-log.ts';
 import { encoderFor } from '../agent/count.ts';
-import { getSession, newMessage, newSession, putSession, touchTitle, writeSessions, readSessions } from '../store/sessions.ts';
+import { maybeSpill, spillConfigFrom } from '../agent/spill.ts';
+import { appendMessage, getSession, newMessage, newSession, putSession, replaceMessage, insertMessage, touchTitle, writeSessions, readSessions } from '../store/sessions.ts';
 import type { CallRecord, Message, Session } from '../store/sessions.ts';
 import { findProject, cwdOf } from '../store/projects.ts';
 import { readSettings, providerOf } from '../store/settings.ts';
@@ -28,21 +31,23 @@ import { repoFor, forgetRepo } from '../store/checkpoints.ts';
 import { logger } from '../util/log.ts';
 import { createJournal } from './journal.ts';
 import type { RunEvent } from './journal.ts';
-import type { Run } from './run-types.ts';
+import type { Run, SteerMode } from './run-types.ts';
 import { MAX_KEEP_EVENTS } from './run-types.ts';
 
 const log = logger('run');
 
 export type RunnerDeps = {
-  /** 取走排队队列（会话级，注册表持有）：urgent 优先；返回的条目会被落成会话消息 */
-  takeQueued: (sessionId: string, mode: 'steer' | 'urgent') => Array<{ id: string; text: string; ts: number; mode: 'steer' | 'urgent' }>;
-  queueOf: (sessionId: string) => Array<{ id: string; text: string; ts: number; mode: 'steer' | 'urgent' }>;
+  /** 取走排队队列（会话级，注册表持有）：按语义模式取；返回的条目会被落成会话消息 */
+  takeQueued: (sessionId: string, mode: SteerMode) => Array<{ id: string; text: string; ts: number; mode: SteerMode }>;
+  queueOf: (sessionId: string) => Array<{ id: string; text: string; ts: number; mode: SteerMode }>;
   plugins: ReturnType<typeof import('../modules/plugins/registry.ts').createPluginRegistry>;
   prompts: ReturnType<typeof import('../modules/prompts/registry.ts').createPromptRegistry>;
   resources: ReturnType<typeof import('../modules/resources/index.ts').createResourceRegistry>;
   sudoPassword: () => string;
   /** 由注册表提供的子运行入口 */
-  spawnSubRun: (parent: Run, task: string, opts: { tools?: string[]; readOnly?: boolean; maxRounds?: number }) => Promise<{ ok: boolean; text: string; runId: string }>;
+  spawnSubRun: (parent: Run, task: string, opts: { tools?: string[]; readOnly?: boolean; maxRounds?: number }) => Promise<{ ok: boolean; text: string; runId: string; id?: string }>;
+  /** 子智能体控制面（列表/续谈/中断）：由注册表提供 */
+  subagentCtrl: NonNullable<import('../modules/plugins/types.ts').ToolRunCtx['subagents']>;
 };
 
 export type StartInput = {
@@ -51,6 +56,11 @@ export type StartInput = {
   providerId?: string | null;
   /** 界面上"停止"用不到这里；这是内部用（子智能体复用同一函数） */
   isSub?: boolean;
+  /**
+   * 子智能体**续谈**时复用的内存会话（连同它的消息历史）。
+   * 不传 = 新建一条临时会话（首次 spawn_agent）。见 runs.ts 的 subagents 控制面。
+   */
+  subSession?: Session;
 };
 
 export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps): Promise<void> {
@@ -80,9 +90,10 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
 
   let session: Session | null = null;
   try {
-    // 子智能体的会话是**临时**的：只活在内存里，绝不写进用户的会话文件
+    // 子智能体的会话是**临时**的：只活在内存里，绝不写进用户的会话文件。
+    // 续谈（subSession）时复用它自己的历史，于是"接着上次的结论继续问"可行。
     session = input.isSub
-      ? newSession({ projectId: run.projectId, providerId: input.providerId ?? null })
+      ? (input.subSession ?? newSession({ projectId: run.projectId, providerId: input.providerId ?? null }))
       : (getSession(run.sessionId) ?? putSession(newSession({ projectId: run.projectId })));
     run.sessionId = session.id;
     const settings = readSettings();
@@ -93,9 +104,9 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
     const project = findProject(session.projectId ?? run.projectId);
     const cwd = cwdOf(project, osHome());
 
-    /* 1) 用户消息 */
+    /* 1) 用户消息（走 append-only 日志：msgs 由日志重放得到） */
     const userMsg = newMessage('user', input.text, { ...(input.isSub ? { steer: false } : {}) });
-    session.msgs.push(userMsg);
+    appendMessage(session, userMsg);
     if (!input.isSub) touchTitle(session, input.text);
     session.providerId = provider.id;
     session.model = provider.model;
@@ -120,7 +131,8 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
       ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
       ...(run.task ? { task: run.task } : {}),
     });
-    session.msgs.push(asst);
+    // 占位也进日志：这样"这一段开始了"这件事本身可重放（收尾时再 replace 定稿）
+    appendMessage(session, asst);
 
     const providerCfg: ProviderConfig = {
       ...provider,
@@ -156,17 +168,16 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
         },
       });
 
-    /* 4) 请求视图（跨轮只带用户话与助手正文；工具原文不跨轮） */
-    // 跨轮只带用户话与助手正文（工具原文不跨轮）；
-    // slice(0,-2) 去掉本轮的"用户消息 + 助手占位"，再把这轮的提问作为最后一条补回来
-    const history: ChatMessage[] = input.isSub ? [] : toRequestMessages(session.msgs.slice(0, -2));
+    /* 4) 请求视图（跨轮只带用户话与助手正文；工具原文不跨轮）。
+       slice(0,-2) 去掉本轮的"用户消息 + 助手占位"，再把这轮的提问作为最后一条补回来。
+       子智能体续谈（subSession）走同一套：它的历史就是它自己那几条消息。 */
+    const history: ChatMessage[] = toRequestMessages(session.msgs.slice(0, -2));
     history.push({ role: 'user', content: input.text });
 
     let system = systemOf();
     const ctxLimit = settings.params.ctxLimit ?? 0;
     /** 预留的输出空间：没配 maxTokens 就按 8k 算 —— 这一块也得从"剩余"里扣掉 */
     const reserve = Math.max(0, Math.trunc(Number(settings.params.maxTokens ?? 8192) || 8192));
-
     /* 6) 工具执行器（含子智能体入口）—— 先建，因为"开销"里要算工具表 */
     /* 文件改动的检查点仓库：每条会话一棵影子 git 树（见 store/checkpoints.ts）。
        写文件的工具会拿它"动手前打一笔"，changes 插件用它列改动 / 看 diff / 撤回。 */
@@ -182,6 +193,7 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
       log,
       sudoPassword: deps.sudoPassword,
       runSubagent: (task, opts) => deps.spawnSubRun(run, task, opts),
+      subagents: deps.subagentCtrl,
       changes: ckRepo
         ? {
             snapshot: async (label, files) => {
@@ -192,6 +204,7 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
             },
             list: () => ckRepo.list(),
             diff: (id) => ckRepo.diff(id),
+            show: (id, file) => ckRepo.show(id, file),
             restore: async (id) => {
               const r = await ckRepo.restore(id);
               if (r.ok) emit({ type: 'checkpoint', runId: run.id, sessionId: session!.id, msgId: asst.id, checkpoint: { id, label: `撤回 → ${id}`, files: r.files, restored: true } });
@@ -243,29 +256,40 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
       });
     };
 
-    /* 5) 压缩（超阈值才做，失败不影响本次运行） */
+    /* 5) 压缩（超阈值才做，失败不影响本次运行）。
+       每次压缩产出**一个替换节点**（声明式记录被遮蔽的区间），追加到 session.compact.nodes ——
+       原文仍留在 session.msgs 里可审计，请求视图只在这一层替换（见 agent/context.ts）。 */
     if (
       !input.isSub &&
       ctxLimit > 0 &&
       needsCompaction({
         messages: history,
-        compact: session.compact ?? null,
+        compact: normalizeCompact(session.compact),
         overheadTokens: overhead(),
         ctxLimit,
         compactHeader: '',
         model: provider.model,
       })
     ) {
-      const range = compactRange(history, 6);
+      const range = compactRange(history, 6, normalizeCompact(session.compact));
       if (range) {
         try {
           const complete = async (cfg: ProviderConfig, msgs: ChatMessage[], opts: { signal?: AbortSignal }) =>
             collectText(providerChat(cfg, msgs, { ...opts, params: { ...settings.params, thinkingBudget: 0 } }));
-          const text = await summarize(history.slice(0, range.upTo), deps.prompts.text('compact.prompt'), complete, providerCfg, run.controller.signal);
+          const text = await summarize(history.slice(range.from, range.to), deps.prompts.text('compact.prompt'), complete, providerCfg, run.controller.signal);
           if (text) {
-            session.compact = { upTo: range.upTo, count: range.upTo, text, ts: Date.now() };
+            const node = {
+              id: `c_${Date.now().toString(36)}`,
+              from: range.from,
+              to: range.to,
+              text,
+              ts: Date.now(),
+            };
+            // 压缩节点也走 append-only 日志（可重放、可撤回，见 store/session-log.ts）
+            addCompactNode(session.log ?? (session.log = []), node);
+            session.compact = { nodes: deriveCompact(session.log) };
             putSession(session);
-            log.info('已压缩上下文', { upTo: range.upTo, tokens: estimateMessages(history, provider.model) });
+            log.info('已压缩上下文', { from: range.from, to: range.to, nodes: session.compact.nodes.length });
           }
         } catch (err) {
           log.warn('压缩失败，按原文继续', { err: String(err) });
@@ -283,7 +307,11 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
           return sum + (Number.isFinite(maxCalls) && maxCalls > 0 ? maxCalls : 0);
         }, 0),
     );
-    const maxRounds = input.isSub ? Math.max(2, Number(run.maxRoundsHint ?? 12)) : Math.min(budgetRounds + 2, 200);
+    /* 轮次上限：判定规则集中在 agent/rounds.ts（含"不设硬上限"这条）。
+       子智能体的上限在 runs.ts 里就算好了（它要写进 run.maxRoundsHint），这里只用。 */
+    const maxRounds = input.isSub
+      ? resolveSubRounds({ hint: run.maxRoundsHint })
+      : resolveMainRounds(settings.system.maxRounds, budgetRounds);
 
     /* 7) 落盘节流 */
     let lastPersist = 0;
@@ -301,25 +329,30 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
     let thinkingFull = '';
     let streamedContent = '';
     let statsTotal = { in: 0, out: 0, ms: 0 };
+    /** 这一段运行最后的 turn/step（落盘到助手消息，刷新后统计行仍显示） */
+    let lastTurn = 0;
+    let lastStep = 0;
 
-    /* 插话/立即执行：取队列的同时，把它**落成会话里的用户消息**（刷新后仍在），
-       并广播 steer 事件让界面把本地气泡换成"已生效"。 */
-    const takeQueued = (mode: 'steer' | 'urgent'): string[] => {
+    /* 超长工具结果的落盘配置（系统参数，服务端不设硬上限；见 agent/spill.ts）。
+       回灌给模型的文本超阈值 → 落盘 + 只给头尾预览与路径；journal 仍存全文（可审计）。 */
+    const spillCfg = spillConfigFrom(settings.system);
+
+    /* 插话/打断：取队列的同时，把它**落成会话里的用户消息**（刷新后仍在）。
+       界面上的排队条靠 `steer` 事件的 `taken` 收掉（takeQueued 里已经广播过）。 */
+    const takeQueued = (mode: SteerMode): string[] => {
       const items = deps.takeQueued(run.sessionId, mode);
       const out = items.map((i) => i.text);
       for (const item of items) {
         const text = item.text;
         /* 插话**不画气泡**：它在界面上的唯一呈现就是循环注入的那句浅文字提示
            （见 Message.jsx 的 notices）。所以这里记下模式，提示由 onNotice 落盘。 */
-        const m = newMessage('user', text, { steer: true, steerMode: mode });
-        const at = session!.msgs.findIndex((x) => x.id === asst.id);
-        if (at >= 0) session!.msgs.splice(at, 0, m);
-        else session!.msgs.push(m);
+        const m = newMessage('user', text, { steer: true, steerMode: mode === 'queue' ? 'steer' : mode });
+        // 插话插在"当前助手占位"之前 —— 走日志的 insert 事件（重放时也落在同一位置）
+        insertMessage(session!, asst.id, m);
         if (!input.isSub) {
           putSession(session!);
           emit({ type: 'msg', runId: run.id, sessionId: session!.id, msg: m });
         }
-        emit({ type: 'steer', runId: run.id, sessionId: session!.id, msgId: asst.id, id: item.id, text, mode, state: 'taken' });
       }
       return out;
     };
@@ -329,6 +362,7 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
     const result = await runLoop({
       cfg: providerCfg,
       params: settings.params,
+      sys: settings.system,
       system,
       history,
       tools: executor.toolDefs().filter((t) => !(input.isSub && t.name === 'spawn_agent')),
@@ -336,7 +370,7 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
       isExclusive: (name) => executor.isExclusive(name),
       signal: run.controller.signal,
       log,
-      runTool: async (call, seq, at) => {
+      runTool: async (call, seq, at, toolSignal) => {
         const record: CallRecord = {
           seq,
           contentAt: at,
@@ -349,8 +383,12 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
         calls.push(record);
         emit({ type: 'call', runId: run.id, sessionId: session!.id, msgId: asst.id, call: { ...record } });
 
-        const exec = await executor.run(call, seq);
+        /* 工具自己只认一个 signal：整段运行的中断（停止）与"这一个工具的掐断"
+           （用户点打断）合并成一个 —— 任一触发，工具都得停。
+           AbortSignal.any 在 Node 18+ 可用（本工程 engines 要求 >=22.6）。 */
+        const exec = await executor.run(call, seq, toolSignal);
         record.state = exec.result.ok ? 'ok' : 'fail';
+        if (!exec.result.ok && exec.result.errorCode) record.errorCode = exec.result.errorCode;
         record.ms = exec.ms;
         record.digest = exec.result.note ?? '';
         record.chars = exec.result.text.length;
@@ -367,13 +405,23 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
           pluginId: exec.pluginId,
           args: call.args,
           ok: exec.result.ok,
+          ...(exec.result.errorCode ? { errorCode: exec.result.errorCode } : {}),
           text: exec.result.text,
           ms: exec.ms,
         });
+        /* 超长结果落盘：journal 存的是**全文**（审计用），这里只把回灌给模型的那份换成
+           头尾预览 + 路径。落盘失败时 maybeSpill 返回原文，行为不变。 */
+        const spilled = maybeSpill(spillCfg, { runId: run.id, seq, name: call.name }, exec.result.text);
+        if (spilled.path) record.spill = { path: spilled.path, chars: spilled.chars ?? exec.result.text.length };
         emit({ type: 'call_done', runId: run.id, sessionId: session!.id, msgId: asst.id, call: { ...record } });
         persist();
         if (exec.result.refreshPrompt) system = systemOf();
-        return { ok: exec.result.ok, text: exec.result.text, ...(exec.result.images?.length ? { images: exec.result.images } : {}) };
+        return {
+          ok: exec.result.ok,
+          text: spilled.text,
+          ...(exec.result.errorCode ? { errorCode: exec.result.errorCode } : {}),
+          ...(exec.result.images?.length ? { images: exec.result.images } : {}),
+        };
       },
       events: {
         onThinkingDelta: (text) => {
@@ -391,12 +439,16 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
           statsTotal.in += info.usage.input;
           statsTotal.out += info.usage.output;
           statsTotal.ms += info.ms;
+          lastTurn = info.turn;
+          lastStep = info.step;
           emit({
             type: 'round',
             runId: run.id,
             sessionId: session!.id,
             msgId: asst.id,
             round: info.round,
+            turn: info.turn,
+            step: info.step,
             stats: { in: info.usage.input, out: info.usage.output, ms: info.ms },
           });
           // 每轮收尾都重报一次占用：界面上下文环随对话推进实时更新
@@ -411,6 +463,9 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
         onCallStart: (ac) => {
           run.currentCall = ac;
         },
+        onToolStart: (ac) => {
+          run.currentTool = ac;
+        },
         render: (id, vars) => deps.prompts.text(id, vars),
       },
     });
@@ -424,9 +479,14 @@ export async function executeRun(run: Run, input: StartInput, deps: RunnerDeps):
     asst.calls = calls;
     asst.notices = notices.length ? notices : undefined;
     asst.stats = { in: statsTotal.in, out: statsTotal.out, ms: statsTotal.ms };
+    if (lastTurn) asst.turn = lastTurn;
+    if (lastStep) asst.step = lastStep;
     if (!result.ok && result.error) asst.error = result.error;
     journal.saveThinking(asst.id, thinkingFull, '');
     run.finalText = result.finalText || streamedContent;
+    /* 定稿：占位（先前进日志的那个快照）此刻补全 —— 用 replace 事件把定稿写回日志，
+       于是"从日志重放"得到的就是定稿后的这条助手消息（真源自洽）。 */
+    replaceMessage(session, asst);
     if (!input.isSub) putSession(session);
 
     run.status = result.aborted ? 'stopped' : result.ok ? 'ok' : 'error';

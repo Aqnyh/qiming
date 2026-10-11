@@ -23,6 +23,7 @@ import { memoryPlugin } from './builtin/memory-tools.ts';
 import { skillPlugin } from './builtin/skill-tools.ts';
 import { subagentPlugin } from './builtin/subagent.ts';
 import { mediaPlugin } from './builtin/media.ts';
+import { changesPlugin } from './builtin/changes.ts';
 
 export type CustomToolDef = {
   name: string;
@@ -177,6 +178,7 @@ export function createPluginRegistry() {
   /** 内置插件定义（工具在这里构造一次） */
   const builtins: PluginDef[] = [
     { ...fsPlugin, tools: fsTools() },
+    { ...changesPlugin },
     { ...execPlugin, tools: execTools() },
     { ...waitPlugin },
     { ...deliverPlugin },

@@ -8,6 +8,12 @@
  *     ChatView 根节点少了 min-h-0，整列被内容撑高 → 变成整个文档在滚）；
  *   · 抽屉是真实的一列（不是浮层），所以它有自己的滚动条，也不会盖住消息。
  *
+ * **手机（<sm）没有右列**（2026-10-10 手机适配）：390px 宽再扣掉 256px 的右列就只剩半屏，
+ * 所以待办/压缩/子智能体/文件改动只在宽屏占位；手机上的过程信息由消息内的折叠组承担。
+ * 同时手机收起左右内边距（两边各 20px 的空白在手机上比一行字还宽）。
+ * 注意「<sm 不占位」要靠 `max-sm:hidden` 这类显式的 display 工具类，不能写
+ * `hidden ... sm:flex`：同层工具类里 w-64 会把前面的 `hidden` 顶掉（Tailwind v4 按源码顺序生效）。
+ *
  * 数据来源：
  *  1. `state.msgs`：服务端整条会话（打开会话/运行收尾时对齐）；
  *  2. `state.streams[activeId]`：正在那段运行的**流式缓冲**（只含正文增量、思考预览、
@@ -22,6 +28,9 @@ import { useApp } from '../state/store.js';
 import Message from './Message.jsx';
 import Composer from './Composer.jsx';
 import TodoPanel from './TodoPanel.jsx';
+import ChangesPanel from './ChangesPanel.jsx';
+import CompactPanel from './CompactPanel.jsx';
+import SubagentPanel from './SubagentPanel.jsx';
 import { visibleMessages } from '../lib/message-parts.js';
 import { Icon } from './ui.jsx';
 
@@ -39,6 +48,8 @@ function streamMessage(stream) {
     thinkingChars: stream.thinkingChars,
     thinkingTail: stream.thinkingTail,
     notices: stream.notices,
+    turn: stream.turn,
+    step: stream.step,
   };
 }
 
@@ -69,8 +80,8 @@ export default function ChatView() {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
       {/* 左列：消息区（自己滚）+ 输入框 —— 同一列所以同宽 */}
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col pl-5">
-        <div ref={scrollerRef} onScroll={onScroll} data-region="messages" className="thin-scroll min-h-0 flex-1 overflow-y-auto pr-5">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col pl-5 max-sm:pl-0">
+        <div ref={scrollerRef} onScroll={onScroll} data-region="messages" className="thin-scroll min-h-0 flex-1 overflow-y-auto pr-5 max-sm:pr-0">
           {/* chat-col = 与输入框共用的同一份宽度（见 styles.css 的 --chat-max） */}
           <div className="chat-col py-2">
             {loading ? <p className="py-10 text-center text-xs text-subtle">正在加载会话…</p> : null}
@@ -92,8 +103,15 @@ export default function ChatView() {
         <Composer />
       </div>
 
-      {/* 右列：待办抽屉（自己有滚动条），与消息区隔 20px */}
-      <TodoPanel />
+      {/* 右列：待办 + 文件改动（各自滚），与消息区隔 20px。手机整列不占位（见文首说明）。
+          用 div 而不是 aside：待办本身就是 <aside>，再套一层 aside 会让
+          "第一个 aside = 侧栏"这类既有约定变得含糊（ui-check 就是按选择器量间距的）。 */}
+      <div className="ml-5 flex w-64 shrink-0 flex-col py-2 max-sm:hidden" aria-label="右列">
+        <TodoPanel />
+        <CompactPanel />
+        <SubagentPanel />
+        <ChangesPanel />
+      </div>
     </div>
   );
 }

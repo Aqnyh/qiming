@@ -347,3 +347,18 @@ html[data-theme='light'] .md pre.md-pre {
     font-size: 16px;
   }
 }
+
+/* ────────────────────────── 触屏（手机/平板）──────────────────────────
+   两件事在手机上不成立，必须在这里兜住：
+    1. **没有 hover**：桌面上靠 `group-hover` 才出现的置顶/归档按钮，触屏上永远不出现
+       → 那些按钮（.row-btn）一律常显，同时把行内那枚时间戳（.row-when）藏掉腾地方；
+    2. **手指比鼠标粗**：32px 的图标键太挤 → 顶栏/抽屉里的关键按键在触屏上放大到 40px。
+   用 pointer:coarse 而不是 max-width：横屏手机、触屏笔记本同样适用。 */
+@media (pointer: coarse) {
+  .row-btn {
+    display: block !important;
+  }
+  .row-when {
+    display: none !important;
+  }
+}

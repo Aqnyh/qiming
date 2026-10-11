@@ -9,6 +9,7 @@
  *
  * 事件同时留在内存里用于"刷新后回放"（限量，超出丢最老的）。
  */
+import type { SteerMode } from './run-types.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runDir } from '../util/paths.ts';
@@ -35,7 +36,7 @@ export type RunEvent =
   | { type: 'call'; runId: string; sessionId: string; msgId: string; call: CallRecord }
   | { type: 'call_done'; runId: string; sessionId: string; msgId: string; call: CallRecord }
   | { type: 'notice'; runId: string; sessionId: string; msgId: string; text: string }
-  /** 用户插话/立即执行的状态（queued = 已收下，taken = 已注入模型） */
+  /** 用户插话/打断的状态（queued = 已收下，taken = 已注入模型） */
   | {
       type: 'steer';
       runId: string;
@@ -45,12 +46,23 @@ export type RunEvent =
       /** 排队条目的 id（界面据此把它从"排队中"里摘掉） */
       id?: string;
       text: string;
-      mode: 'steer' | 'urgent';
+      mode: SteerMode;
       state: 'queued' | 'taken';
       /** 取走执行时：插话落在助手正文的第几个字符（前端据此插回原位） */
       steerAt?: number;
     }
-  | { type: 'round'; runId: string; sessionId: string; msgId: string; round: number; stats: { in: number; out: number; ms: number } }
+  | {
+      type: 'round';
+      runId: string;
+      sessionId: string;
+      msgId: string;
+      round: number;
+      /** 由用户输入划出的段（插话/打断开新 turn） */
+      turn: number;
+      /** 当前 turn 内的模型调用序号 */
+      step: number;
+      stats: { in: number; out: number; ms: number };
+    }
   /**
    * 文件改动的检查点（写文件前打的"动手前"快照）。
    * 界面上的"改动清单"靠它增量刷新；`restored: true` 表示这是一次撤回的结果。
@@ -78,6 +90,8 @@ export type RunCallDetail = {
   pluginId: string;
   args: unknown;
   ok: boolean;
+  /** 失败时的标准错误码（见 modules/plugins/types.ts 的 ToolErrorCode） */
+  errorCode?: string;
   text: string;
   ms: number;
 };

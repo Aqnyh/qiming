@@ -16,9 +16,11 @@ import { readCallDetail, readThinking } from './journal.ts';
 import * as memory from '../modules/memory/index.ts';
 import * as skills from '../modules/skills/index.ts';
 import { publicSettings, readSettings, patchSettings, mergeProviders, providerOf } from '../store/settings.ts';
+import type { SteerMode } from './run-types.ts';
 import {
   addProject,
   archiveProject,
+  cwdOf,
   findProject,
   insideWorkspace,
   listProjects,
@@ -38,10 +40,41 @@ import {
   putSession,
   sessionSummaries,
 } from '../store/sessions.ts';
-import type { Session } from '../store/sessions.ts';
-import { usageOf } from '../agent/context.ts';
+import type { Session, Message } from '../store/sessions.ts';
+import { normalizeCompact, usageOf, viewMessages } from '../agent/context.ts';
+import { deriveCompact, removeCompactNodeById } from '../store/session-log.ts';
+import type { SessionEvent } from '../store/session-log.ts';
 import { toRequestMessages } from './runner.ts';
+import { repoFor } from '../store/checkpoints.ts';
 import { DOWNLOADS_DIR, osHome, osUser } from '../util/paths.ts';
+
+/**
+ * 事件日志的**默认视图**：给"够看清发生了什么"的摘要，而不是空壳。
+ *
+ * 教训（2026-10-10）：之前默认分支只回 `{seq,type,ts}`，于是日志窗口不点「原始载荷」
+ * 就只剩一个类型徽章、看不到任何内容 —— 违背"一切可见可改"的宗旨。现在默认也带内容：
+ *   · 消息事件：角色 + 正文（截断）+ 工具调用摘要 + 思考摘要；
+ *   · 压缩节点：区间 + 替换文本；
+ *   · 需要逐字段原始数据时再点「原始载荷」（?raw=1 给完整对象）。
+ */
+function compactEvent(ev: SessionEvent) {
+  const base = { seq: ev.seq, type: ev.type, ts: ev.ts };
+  if (ev.type === 'append' || ev.type === 'insert' || ev.type === 'replace') {
+    const m = ev.msg as Message & { calls?: unknown[]; thinking?: string };
+    return {
+      ...base,
+      ...(ev.type === 'insert' ? { beforeId: ev.beforeId } : {}),
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content.slice(0, 400) : '',
+      ...(Array.isArray(m.calls) && m.calls.length ? { calls: m.calls.length } : {}),
+      ...(m.thinking ? { thinking: String(m.thinking).slice(0, 200) } : {}),
+      msg: { role: m.role, content: typeof m.content === 'string' ? m.content.slice(0, 400) : '' },
+    };
+  }
+  if (ev.type === 'compact_add') return { ...base, node: { id: ev.node.id, from: ev.node.from, to: ev.node.to, text: ev.node.text } };
+  if (ev.type === 'compact_remove') return { ...base, nodeId: ev.nodeId };
+  return base;
+}
 
 export async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, ctx: AppCtx): Promise<boolean> {
   const p = url.pathname;
@@ -116,7 +149,40 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
           queue: ctx.runs.queueOf(id),
           // 上下文占用：不跑的时候也要显示（否则顶栏的环只在那一段运行时才有数）
           usage: sessionUsage(session),
+          // 压缩替换节点：让"替掉了哪段、替成了什么"可见、可撤回（见 agent/context.ts）
+          compact: normalizeCompact(session.compact)?.nodes ?? [],
+          // 文件改动：刷新后"改过哪些文件"仍在（右列那个面板读它）
+          changes: (await checkpointOf(session)?.list()) ?? [],
         }), true;
+      }
+      if (tail === 'log' && method === 'GET') {
+        /* 会话事件日志（append-only 真源）：让"会话里到底发生过什么"可追溯、可审计。
+           `?raw=1` 给每条事件的原始载荷；默认给精简摘要（免得一次传太大）。 */
+        const session = getSession(id);
+        if (!session) return json(res, 404, { error: '会话不存在' }), true;
+        const log = session.log ?? [];
+        const raw = url.searchParams.get('raw') === '1';
+        const events = log.map((ev) => (raw ? ev : compactEvent(ev)));
+        return json(res, 200, { count: log.length, events }), true;
+      }
+      if (tail === 'compact' && method === 'GET') {
+        // 压缩节点清单：让"替掉了哪段、替成了什么"可见可审计（见 agent/context.ts）
+        const session = getSession(id);
+        if (!session) return json(res, 404, { error: '会话不存在' }), true;
+        return json(res, 200, { nodes: normalizeCompact(session.compact)?.nodes ?? [], total: session.msgs.length }), true;
+      }
+      if (tail === 'compact' && method === 'DELETE') {
+        // 删掉一个压缩节点 = 那段历史回到请求视图（可撤回）。也走日志（compact_remove）
+        const session = getSession(id);
+        if (!session) return json(res, 404, { error: '会话不存在' }), true;
+        const nodeId = url.searchParams.get('node') ?? '';
+        removeCompactNodeById(session.log ?? (session.log = []), nodeId);
+        session.compact = (() => {
+          const nodes = deriveCompact(session.log!);
+          return nodes.length ? { nodes } : undefined;
+        })();
+        putSession(session);
+        return json(res, 200, { ok: true, nodes: session.compact?.nodes ?? [] }), true;
       }
       if (tail === 'archive' && method === 'POST') {
         const body = await readJson<{ archived?: boolean }>(req);
@@ -151,12 +217,18 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
     /* ───────── 发消息 / 停止 ───────── */
     if (p === '/api/chat' && method === 'POST') {
       const body = await readJson<{ sessionId?: string; projectId?: string | null; text?: string; providerId?: string | null; mode?: string }>(req);
+      /* 三种语义（见 run-types.ts 的 SteerMode）：steer 当前轮次内注入 / urgent 打断立即 / queue 排到这一段之后。
+         显式传了合法值就用它；没传/非法值用**系统参数里的默认**（设置 → 系统 → queueDefault，默认 queue）——
+         这正是"运行中再发一句，默认应该在当前轮次跑完后自动执行"这条要求的落点。 */
+      const fallback = readSettings().system.queueDefault ?? 'queue';
+      const raw = String(body.mode ?? '');
+      const mode: SteerMode = raw === 'urgent' || raw === 'queue' || raw === 'steer' ? raw : fallback;
       const r = ctx.runs.start({
         sessionId: body.sessionId,
         projectId: body.projectId ?? null,
         text: String(body.text ?? ''),
         providerId: body.providerId ?? null,
-        mode: body.mode === 'urgent' ? 'urgent' : 'steer',
+        mode,
       });
       return json(res, r.ok ? 200 : 409, r), true;
     }
@@ -179,6 +251,21 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
     if (p === '/api/run/stop' && method === 'POST') {
       const body = await readJson<{ runId?: string; sessionId?: string }>(req);
       return json(res, 200, { ok: ctx.runs.stop(body.runId, body.sessionId) }), true;
+    }
+
+    /* ───────── 子智能体控制面（列表 / 续谈 / 中断）：可列举、可续、可中断 ───────── */
+    if (p === '/api/subagents' && method === 'GET') {
+      return json(res, 200, { subagents: ctx.runs.subagents.list() }), true;
+    }
+    if (p === '/api/subagents' && method === 'POST') {
+      const body = await readJson<{ id?: string; action?: string; text?: string }>(req);
+      const id = String(body.id ?? '');
+      if (!id) return json(res, 400, { error: 'id 必填' }), true;
+      if (body.action === 'stop') return json(res, 200, { ok: ctx.runs.subagents.stop(id) }), true;
+      const text = String(body.text ?? '').trim();
+      if (!text) return json(res, 400, { error: '续谈需要 text' }), true;
+      const r = await ctx.runs.subagents.send(id, text);
+      return json(res, r.ok ? 200 : 400, r), true;
     }
 
     /* ───────── SSE 事件流 ───────── */
@@ -342,6 +429,7 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
       }
       if ('activeId' in body) next.activeId = body.activeId as string | null;
       if (body.params && typeof body.params === 'object') next.params = body.params as Record<string, never>;
+      if (body.system && typeof body.system === 'object') next.system = body.system as Record<string, never>;
       if (typeof body.workspace === 'string') next.workspace = body.workspace;
       if (body.ui && typeof body.ui === 'object') next.ui = body.ui as Record<string, never>;
       return json(res, 200, publicSettings(patchSettings(next))), true;
@@ -503,6 +591,30 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
       }
     }
 
+    /* ───────── 文件改动（检查点：看 diff / 撤回） ───────── */
+    if (p === '/api/changes/diff' && method === 'GET') {
+      const session = getSession(url.searchParams.get('sessionId') ?? '');
+      if (!session) return json(res, 404, { error: '会话不存在' }), true;
+      const repo = checkpointOf(session);
+      if (!repo) return json(res, 200, { diff: '', stat: { files: 0, added: 0, removed: 0, list: [] } }), true;
+      const id = url.searchParams.get('checkpoint') ?? '';
+      const file = url.searchParams.get('path') ?? '';
+      const out = id ? await repo.show(id, file || undefined) : await repo.diff();
+      return json(res, 200, out), true;
+    }
+    if (p === '/api/changes/restore' && method === 'POST') {
+      const body = await readJson<{ sessionId?: string; checkpoint?: string }>(req);
+      const session = getSession(String(body.sessionId ?? ''));
+      if (!session) return json(res, 404, { error: '会话不存在' }), true;
+      if (ctx.runs.ofSession(session.id)?.status === 'running') {
+        return json(res, 409, { error: '会话正在运行：先停止，再撤回（否则模型可能立刻又写回去）。' }), true;
+      }
+      const repo = checkpointOf(session);
+      if (!repo) return json(res, 500, { error: '检查点仓库不可用（改动记录未启用）' }), true;
+      const r = await repo.restore(String(body.checkpoint ?? ''));
+      return json(res, r.ok ? 200 : 400, r), true;
+    }
+
     /* ───────── 待办 / 待下载 ───────── */
     if (p === '/api/todo' && method === 'GET') {
       const sessionId = url.searchParams.get('sessionId') ?? '';
@@ -546,6 +658,19 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
 }
 
 /**
+ * 检查点访问（给 API 层用）。
+ *
+ * 为什么收成一个小对象：检查点仓库是**按会话 + 工作目录**建的（会话 = 一次任务），
+ * 而 API 只知道 sessionId。这里把"找会话 → 算它的工作目录 → 拿仓库"收在一起，
+ * 找不到就把结果降级成空（而不是抛错），上层只管返回。
+ */
+function checkpointOf(session: Session) {
+  const project = findProject(session.projectId);
+  const cwd = cwdOf(project, osHome());
+  return repoFor(session.id, cwd);
+}
+
+/**
  * 会话的上下文占用（给界面顶栏的上下文环用）。
  *
  * 口径与 runner 里的压缩判定**完全一致**（同一个 usageOf）—— 否则会出现
@@ -559,8 +684,8 @@ function sessionUsage(session: Session) {
     const settings = readSettings();
     const provider = providerOf(settings, session.providerId);
     const messages = toRequestMessages(session.msgs);
-    const compact = session.compact ?? null;
-    const view = compact && compact.upTo > 0 ? messages.slice(Math.min(compact.upTo, messages.length)) : messages;
+    const compact = normalizeCompact(session.compact);
+    const view = compact ? viewMessages({ messages, compact, compactHeader: '', overheadTokens: 0, ctxLimit: 0 }) : messages;
     return usageOf({
       messages: view,
       system: '',

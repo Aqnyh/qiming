@@ -24,6 +24,7 @@ import path from 'node:path';
 import { simpleGit, type SimpleGit } from 'simple-git';
 import { CHECKPOINTS_DIR, checkpointDir } from '../util/paths.ts';
 import { logger } from '../util/log.ts';
+import { readSettings } from './settings.ts';
 
 const log = logger('checkpoint');
 
@@ -46,6 +47,36 @@ export type Checkpoint = {
   beforeRestore?: boolean;
 };
 
+/** diff 里的一行（`-` 删 / `+` 增 / ` ` 上下文；\ No newline 这类元信息行不进这里） */
+export type DiffLine = {
+  /** old/new 行号（该侧没有就是 null —— 新增行没有旧行号，删除行没有新行号） */
+  oldNo: number | null;
+  newNo: number | null;
+  kind: 'add' | 'del' | 'ctx';
+  text: string;
+};
+
+/** 一个文件的 diff（GitHub 那种按文件分组的呈现） */
+export type DiffFile = {
+  /** 相对工作目录的路径（重命名时是"新名字"） */
+  path: string;
+  /** 旧路径（只有重命名/复制才有） */
+  oldPath?: string;
+  added: number;
+  removed: number;
+  /** 二进制文件：没有逐行内容 */
+  binary: boolean;
+  lines: DiffLine[];
+};
+
+export type DiffResult = {
+  /** 纯文本 diff（统一格式，带 --unified=3），命令行工具与"复制"仍可用 */
+  text: string;
+  stat: { files: number; added: number; removed: number; list: Array<{ path: string; added: number; removed: number }> };
+  /** 结构化逐行数据：界面据此渲染行号、增删底色、按文件折叠 */
+  files: DiffFile[];
+};
+
 export type CheckpointRepo = {
   sessionId: string;
   cwd: string;
@@ -54,12 +85,17 @@ export type CheckpointRepo = {
   /** 把工作树恢复到某个快照 */
   restore: (id: string) => Promise<{ ok: boolean; detail: string; files: string[]; removed: string[] }>;
   /** 当前工作树相对最新快照的改动 */
-  diff: (id?: string) => Promise<{
-    text: string;
-    stat: { files: number; added: number; removed: number; list: Array<{ path: string; added: number; removed: number }> };
-  }>;
+  diff: (id?: string) => Promise<DiffResult>;
   /** 有没有未快照的改动 */
   hasChanges: () => Promise<boolean>;
+  /**
+   * 某个检查点之后改了什么（与下一个检查点比；最新的那条与当前工作树比）。
+   *
+   * `files` 是**结构化**的逐行数据（GitHub 风格并排/统一视图都靠它）：
+   * 界面不再自己解析 diff 文本，行号、增删、折叠区间都由服务端算好。
+   * `text` 仍然返回（纯文本，给命令行工具与"复制"用）。
+   */
+  show: (id: string, file?: string) => Promise<DiffResult>;
   /** 检查点列表（新→旧） */
   list: () => Promise<Checkpoint[]>;
   /** 删除整个检查点仓库（会话被彻底删除时用） */
@@ -148,6 +184,9 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
 
   let ready: Promise<void> | null = null;
 
+  /** 本会话累计"动过的路径"的内存副本（元数据是持久层，这里是热路径的缓存） */
+  let latestTouched: string[] | null = null;
+
   /** 检查点目录若落在工作目录内，必须排除掉（否则影子仓库会把自己也跟踪进去） */
   function ignoreBody(): string {
     const relCheckpoints = path.relative(cwd, CHECKPOINTS_DIR);
@@ -208,13 +247,33 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
     try {
       await ensureInit();
       const g = git();
+      /* **只把"这次要动的路径"同步进索引，绝不做 `add -A .`**。
+         这一条是踩出来的：会话没绑项目时 cwd 就是家目录，`git add -A .` 会把几十万个文件
+         逐个 stat 一遍 —— 一次 write_file 就能卡住几十秒，整个循环跟着停摆（e2e 里表现为超时）。
+         没有可用的路径范围时宁可**不记**这一笔，也不扫全树。 */
+      const declared = scopeOf(cwd, files);
+      /* 没申报路径时（系统快照，如"撤回前备份"）退回"本会话动过的路径 + 索引里已有的路径"：
+         两处都是有界的，绝不退化成全树扫描。 */
+      const scope = declared.length ? declared : await scopeFor(g, []);
+      if (!scope.length) {
+        log.warn('快照缺少路径范围，已跳过（不做全树扫描）', { sessionId, label });
+        return null;
+      }
       const isFirst = !(await hasHead(g));
       /* 顺序有讲究：**先 add 再取 diff**。
          空仓库里 `git diff HEAD` 会报"有歧义的参数 'HEAD'"，而 `git diff --cached` 永远可用。
          这份 diff 描述的是**上一次**改动（本函数记的是"动手前"），所以写回上一个快照的元数据。 */
-      await R(g, 'add', '-A', '.');
+      /* 申报的路径**无条件记下来**（与"这次有没有产生新快照"无关）：
+         文件真建出来之后是未跟踪文件，git 的索引与快照树里都没有它，
+         只有这份清单能让 diff/撤回知道该看它。 */
+      mergeTouched(scope);
+      /* 第三个参数是"申报过的路径"：被忽略目录里的文件靠它才进得了索引（见 stagePaths 注释） */
+      await stagePaths(g, scope, [...declared, ...readTouched()]);
       const staged = await R(g, 'diff', '--cached', '--name-only');
-      if (!isFirst && !staged.trim()) return null; // 没变化就不必再记一笔
+      /* 空仓库时**即使没有内容也要建第一个提交**：这样 HEAD 立刻存在，
+         之后"新建的文件"才有可比对的基准（否则 diff 会因为"没有 HEAD"返回空）。
+         有 HEAD 之后，内容没变化就不必再记一笔（典型：要新建的文件此刻还不存在）。 */
+      if (!isFirst && !staged.trim()) return null;
       const stat = await cachedStat(g);
       await R(g, 'commit', '-q', '-m', label.slice(0, 200) || 'snapshot', '--allow-empty');
       const sha = (await R(g, 'rev-parse', 'HEAD')).trim();
@@ -225,7 +284,7 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
         sha,
         ts: Date.now(),
         label: label.slice(0, 200),
-        files: files.map((f) => rel(cwd, f)).filter(Boolean).slice(0, 40),
+        files: scope.slice(0, 40),
         ...(opts.beforeRestore ? { beforeRestore: true } : {}),
       };
       if (!isFirst && stat.files) {
@@ -258,6 +317,9 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
       const target = await resolve(g, id);
       if (!target) return { ok: false, detail: `找不到检查点 ${id}（可以列出来看看有哪些）`, files: [], removed: [] };
 
+      /* 撤回前先把当前状态记一笔（撤回也能被撤回）。
+         这里**不传路径**（系统快照没有"要动的文件"）—— 范围由 snapshot 自己从
+         "动过的路径 + 索引"里取，不做全树扫描。 */
       await snapshot('撤回前的状态（可再撤回来）', [], { beforeRestore: true });
 
       const inTarget = new Set(await treePaths(g, target));
@@ -273,24 +335,33 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
           /* 删不掉就留着，能让用户看到 */
         }
       }
-      await R(g, 'checkout', target, '--', '.');
-      // 未跟踪的新文件（clean -n 先列出来，便于如实汇报；-x 不传：被忽略的不动）
+      /* 只 checkout 目标快照里**确实存在**的路径：快照可能是空树（"新建文件"那一笔就是），
+         此时 `checkout <sha> -- .` 会 fatal（"路径规格 '.' 未匹配任何 Git 已知文件"）。 */
+      const inTargetList = [...inTarget];
+      if (inTargetList.length) await R(g, 'checkout', target, '--', ...inTargetList.slice(0, 400));
+      /* 未跟踪的新文件：`clean -fdq` 清掉它们（不传 -x：被忽略的 node_modules 之类不动）。
+         清单**用 `ls-files --others --exclude-standard` 拿**，不用 `clean -n` ——
+         后者的输出是本地化的（中文环境里是"将删除 xxx"），按前缀解析会漏掉（实测踩过）。
+         范围仍然有界：只问"本会话动过的路径 + 快照里的路径"里有没有未跟踪文件。 */
       let cleanList = '';
       try {
-        cleanList = await R(g, 'clean', '-nd');
+        const dirs = [...new Set([...inTarget, ...tracked, ...readTouched()])];
+        if (dirs.length) cleanList = await R(g, 'ls-files', '--others', '--exclude-standard', '--', ...dirs.slice(0, 400));
       } catch {
         /* ignore */
       }
       try {
-        await R(g, 'clean', '-fdq');
+        await R(g, 'clean', '-fdq', '--', ...(await scopeFor(g, [...inTarget])).slice(0, 400));
       } catch {
         /* ignore */
       }
       for (const line of cleanList.split('\n')) {
-        const p = line.replace(/^Would remove\s+/, '').trim();
+        const p = line.trim();
         if (p) removed.push(rel(cwd, p));
       }
-      await R(g, 'add', '-A', '.');
+      /* 索引对齐工作树：范围 = 目标快照里的路径 ∪ 索引里已有的路径 ∪ 本会话动过的路径
+         （都不需要扫工作树） */
+      await stagePaths(g, await scopeFor(g, [...inTarget, ...tracked]), readTouched());
       await R(g, 'commit', '-q', '-m', `restore -> ${target.slice(0, 12)}`, '--allow-empty');
       const detail =
         removed.length > 0
@@ -311,6 +382,151 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
     }
   }
 
+  /** 索引里已跟踪的路径（`ls-files` 只读索引，不碰工作树 —— 毫秒级） */
+  async function trackedPaths(g: SimpleGit): Promise<string[]> {
+    try {
+      const out = await R(g, 'ls-files');
+      return out.split('\n').map((l) => l.trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * "这次快照要管的路径" = 本次申报的路径 ∪ 本会话历史上被改动过的路径 ∪ 索引里已有的路径。
+   *
+   * 中段那份清单是给**新建的未跟踪文件**用的：它不在索引里、也不在任何快照树里，
+   * 只看 git 的这两处信息来源会完全看不见它（diff 为空，用户以为没记上）。
+   * 清单是工具申报出来的，有界（不是扫描结果）。
+   */
+  async function scopeFor(g: SimpleGit, extra: string[]): Promise<string[]> {
+    return [...new Set([...extra, ...readTouched(), ...(await trackedPaths(g))])];
+  }
+
+  /**
+   * 累计"动过的路径"（有上限，新的优先）。
+   *
+   * 存成会话级独立文件（`touched.json`），**不挂在某笔快照的元数据上** ——
+   * 踩过的坑：挂元数据时，会话里"第一次新建文件"这一笔因为内容没变化不产生新快照，
+   * 清单就丢了，之后 diff/撤回完全看不见这个新文件（最常见的新建场景直接失效）。
+   */
+  function mergeTouched(scope: string[]): string[] {
+    const out = [...new Set([...scope, ...readTouched()])].slice(0, TOUCHED_MAX);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'touched.json'), `${JSON.stringify(out)}\n`, 'utf8');
+    } catch {
+      /* 记不住就退化成"只看 git 已知的路径"，不影响写文件 */
+    }
+    return out;
+  }
+
+  function readTouched(): string[] {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, 'touched.json'), 'utf8')) as unknown;
+      return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 把一批路径同步进索引。
+   *
+   * 四个必须绕开的坑（全部实测过）：
+   *  · **绝不退化成 `add -A .`**：cwd 可能是家目录，全树扫描会把循环卡死 ——
+   *    范围永远来自"申报过的路径"，有界；
+   *  · **被忽略的路径会让 `add` 整体失败**（"下列路径根据您的一个 .gitignore 文件而被忽略"，
+   *    exit=1，**这一批里其它路径也不会进索引**）。影子仓库自带忽略清单（`node_modules/`、
+   *    `out/`、`*.log`…），而 agent 亲写的文件恰恰可能落在里面 —— 于是 diff 里完全看不见，
+   *    用户以为没记上（实测：写 `out/note.txt` 后面板空空如也）。
+   *    两条对策：① 申报过的普通小文件用 `git add -f` 强制进索引（覆盖 excludesFile 与项目
+   *    自己的 .gitignore）；② 剩下的先问 `check-ignore` 剔掉。检查点目录自己与 `.git` 永不强制；
+   *  · **`check-ignore` 会把"已跟踪"的文件也报成忽略**（实测 exit=0），所以问之前先排掉已跟踪的，
+   *    否则会把正常文件误剔；
+   *  · **已跟踪但已被删除的路径，`add -A` 也会失败**（"路径规格未匹配任何文件"/被忽略提示），
+   *    而"删除文件"正是要记的改动。这类走 `update-index --force-remove`：只动索引、不碰工作树。
+   */
+  async function stagePaths(g: SimpleGit, scope: string[], declared: string[] = []): Promise<void> {
+    if (!scope.length) return;
+    const tracked = new Set(await trackedPaths(g));
+    const present: string[] = [];
+    const goneTracked: string[] = [];
+    for (const p of scope) {
+      if (fs.existsSync(path.join(cwd, p))) present.push(p);
+      else if (tracked.has(p)) goneTracked.push(p);
+    }
+    /* 强制的先算出来（在忽略过滤**之前**）：被忽略的路径恰恰是它要救的那批 */
+    const force = new Set(forceCandidates(present, declared, tracked));
+    const ignored = await ignoredPaths(g, present.filter((p) => !tracked.has(p) && !force.has(p)));
+    const plain = present.filter((p) => !force.has(p) && (!ignored.has(p) || tracked.has(p)));
+    const forced = present.filter((p) => force.has(p));
+    /* 分批：路径太多时命令行会超长（这个上限远高于任何一次工具调用的规模） */
+    await stagedBatch(g, ['add', '-A'], plain);
+    await stagedBatch(g, ['add', '-f', '-A'], forced);
+    await stagedBatch(g, ['update-index', '--force-remove'], goneTracked);
+  }
+
+  /**
+   * 一批一批地写索引；**某一条路径让整批失败时退化成逐条重试**。
+   *
+   * 为什么必须兜底：忽略清单是我们自己给的（`check-ignore`），但它可能问不全 ——
+   * 项目自带的 `.gitignore` 嵌套在子目录里、或者路径是符号链接指向被忽略处，
+   * 都会让一条坏路径把**整批**拖垮（git add 是"全成功或全失败"），
+   * 结果这一笔快照整个丢失（用户看到"没记上"）。逐条重试只牺牲那一条。
+   */
+  async function stagedBatch(g: SimpleGit, args: string[], paths: string[]): Promise<void> {
+    for (let i = 0; i < paths.length; i += 200) {
+      const batch = paths.slice(i, i + 200);
+      if (!batch.length) continue;
+      try {
+        await R(g, ...args, '--', ...batch);
+      } catch {
+        for (const p of batch) {
+          try {
+            await R(g, ...args, '--', p);
+          } catch {
+            /* 单条也不行就算了：它不该拖垮其它路径 */
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * "该不该强制跟踪"：本次申报 ∩ 存在于工作树 ∩ 还没被跟踪 ∩ 普通文件 ∩ 体积不夸张。
+   *
+   * 体积上限是为了守住"影子仓库要小"：`write_file` 可能写出一份大文本，
+   * 但一次工具调用的产物不该让每笔快照都背上它。
+   */
+  function forceCandidates(existing: string[], declared: string[], tracked: Set<string>): string[] {
+    if (!declared.length) return [];
+    const want = new Set(declared.map((p) => rel(cwd, p)));
+    const out: string[] = [];
+    for (const p of existing) {
+      if (!want.has(p) || tracked.has(p) || !forceAllowed(cwd, p)) continue;
+      try {
+        const st = fs.statSync(path.join(cwd, p));
+        if (!st.isFile() || st.size > FORCE_MAX_BYTES) continue;
+      } catch {
+        continue;
+      }
+      out.push(p);
+    }
+    return out;
+  }
+
+  async function ignoredPaths(g: SimpleGit, paths: string[]): Promise<Set<string>> {
+    if (!paths.length) return new Set();
+    try {
+      const out = await R(g, 'check-ignore', '--', ...paths.slice(0, 500));
+      return new Set(out.split('\n').map((l) => l.trim()).filter(Boolean));
+    } catch {
+      /* 一个都没被忽略时 check-ignore 返回非零，这里当成"没有忽略项" */
+      return new Set();
+    }
+  }
+
   async function resolve(g: SimpleGit, id: string): Promise<string | null> {
     const clean = String(id ?? '').trim();
     if (!clean || !/^[0-9a-f]{4,40}$/i.test(clean)) return null; // 只接受 sha，不做任意 rev 解析（防注入）
@@ -321,28 +537,73 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
     }
   }
 
-  async function diff(id?: string) {
+  /**
+   * 某个检查点**之后**改了什么（这个检查点 → 下一个检查点）。
+   *
+   * 为什么是"往后看"而不是"往前看"：快照记的是**动手前**的样子，
+   * 它的原因写在自己的标签里（"edit_file notes/todo.md"），
+   * 那么"这次改动改了什么"就是它与**下一个**快照的差异 —— 标签、行数、diff 三者才对得上。
+   * （刚打的新快照还没有下一个：退回用"工作树 vs 它"，即当前状态。）
+   */
+  async function show(id: string, file?: string): Promise<DiffResult> {
+    const empty: DiffResult = { text: '', stat: { files: 0, added: 0, removed: 0, list: [] }, files: [] };
     try {
       await ensureInit();
       const g = git();
-      if (!(await hasHead(g))) return { text: '', stat: { files: 0, added: 0, removed: 0, list: [] } };
+      const target = await resolve(g, id);
+      if (!target) return empty;
+      const order = (await R(g, 'log', '--pretty=format:%H', '-n', '300')).split('\n').map((s) => s.trim()).filter(Boolean);
+      const idx = order.indexOf(target);
+      if (idx < 0) return empty;
+      // order 是"新→旧"，所以下一个（更晚的）快照是 idx-1；idx=0 表示它已经是最新的
+      const next = idx > 0 ? order[idx - 1]! : '';
+      const pathspec = file ? ['--', rel(cwd, file)] : [];
+      /* 最新那条（还没有"下一个快照"）：要跟**当前工作树**比。
+         新建的未跟踪文件不会出现在 `git diff <sha>` 里，所以先把"这次改动涉及的路径"
+         同步进索引再比 —— 范围来自索引 + 快照树，不做全树扫描（见 stagePaths 的说明）。 */
+      if (!next) await stagePaths(g, await scopeFor(g, await treePaths(g, target)), readTouched());
+      const diffArgs = next ? [target, next] : ['--cached', target];
+      return await collectDiff(g, diffArgs, pathspec);
+    } catch (err) {
+      log.warn('取检查点 diff 失败', { sessionId, id, err: String(err) });
+      return empty;
+    }
+  }
+
+  async function diff(id?: string): Promise<DiffResult> {
+    const empty: DiffResult = { text: '', stat: { files: 0, added: 0, removed: 0, list: [] }, files: [] };
+    try {
+      await ensureInit();
+      const g = git();
+      if (!(await hasHead(g))) return empty;
       const target = id ? await resolve(g, id) : (await R(g, 'rev-parse', 'HEAD')).trim();
-      if (!target) return { text: '', stat: { files: 0, added: 0, removed: 0, list: [] } };
-      /* 先 add 再比 —— 关键在于**新建的文件**：未跟踪文件不会出现在 `git diff HEAD` 里，
-         只显示"改了已有文件"，用户会以为新文件没被记录。staged 一次之后索引=工作树，
-         后面的 diff 也就等价于"工作树 vs 快照"（与打快照时的口径完全一致）。 */
-      await R(g, 'add', '-A', '.');
-      const text = await R(g, 'diff', '--cached', '--no-color', target);
-      const list = parseList(await R(g, 'diff', '--cached', '--numstat', target));
-      const stat = list.reduce(
-        (acc, it) => ({ files: acc.files + 1, added: acc.added + it.added, removed: acc.removed + it.removed }),
-        { files: 0, added: 0, removed: 0 },
-      );
-      return { text, stat: { ...stat, list } };
+      if (!target) return empty;
+      /* 先同步索引再比 —— 关键在于**新建的文件**：未跟踪文件不会出现在 `git diff HEAD` 里，
+         只显示"改了已有文件"，用户会以为新文件没被记录。
+         范围 = 快照树里的路径 ∪ 索引里已有的路径（两次都只读索引/树，不扫工作树）。 */
+      await stagePaths(g, await scopeFor(g, await treePaths(g, target)), readTouched());
+      return await collectDiff(g, ['--cached', target], []);
     } catch (err) {
       log.warn('取 diff 失败', { sessionId, err: String(err) });
-      return { text: '', stat: { files: 0, added: 0, removed: 0, list: [] } };
+      return empty;
     }
+  }
+
+  /**
+   * 一次取齐"纯文本 + 结构化 + 统计"。
+   *
+   * `--unified=3` 显式写死：默认值就是 3，但不依赖默认值 —— 用户可能在 ~/.gitconfig
+   * 里设了 `diff.context`，那会让折叠区间与别人的不一致（这里的影子仓库不读全局配置，
+   * 但显式传更保险，也把"界面每次折叠 3 行"这件事写死在协议里）。
+   */
+  async function collectDiff(g: SimpleGit, diffArgs: string[], pathspec: string[]): Promise<DiffResult> {
+    const text = await R(g, 'diff', '--no-color', '--no-ext-diff', '--unified=3', ...diffArgs, ...pathspec);
+    const list = parseList(await R(g, 'diff', '--numstat', '--no-ext-diff', ...diffArgs, ...pathspec));
+    const stat = list.reduce(
+      (acc, it) => ({ files: acc.files + 1, added: acc.added + it.added, removed: acc.removed + it.removed }),
+      { files: 0, added: 0, removed: 0 },
+    );
+    return { text, stat: { ...stat, list }, files: parseUnifiedDiff(text) };
   }
 
   async function hasChanges(): Promise<boolean> {
@@ -351,9 +612,25 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
       const g = git();
       if (!(await hasHead(g))) return false;
       const out = await R(g, 'status', '--porcelain');
-      return out.split('\n').some((l) => {
-        const p = l.slice(3).trim();
-        return Boolean(p) && !isIgnoredPath(p);
+      if (
+        out.split('\n').some((l) => {
+          const p = l.slice(3).trim();
+          return Boolean(p) && !isIgnoredPath(p);
+        })
+      ) {
+        return true;
+      }
+      /* `status --porcelain` 看不见**被忽略**的未跟踪文件，而 agent 亲写的文件可能就在
+         忽略目录里（`out/`、`dist/`…）。用"申报过的路径里有没有索引还不认识的文件"补齐 ——
+         范围来自清单，有界，不做全树扫描。 */
+      const tracked = new Set(await trackedPaths(g));
+      return readTouched().some((p) => {
+        if (tracked.has(p) || !forceAllowed(cwd, p)) return false;
+        try {
+          return fs.statSync(path.join(cwd, p)).isFile();
+        } catch {
+          return false;
+        }
       });
     } catch {
       return false;
@@ -371,7 +648,13 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
       await ensureInit();
       const g = git();
       if (!(await hasHead(g))) return [];
-      const out = await R(g, 'log', '--pretty=format:%H|%ct|%s', '-n', '200');
+      /* 列表窗口条数来自系统参数（设置 → 系统 → checkpointLimit），**不是硬编码**：
+         0 = 不限制（列出全部）。检查点本身不会因为超限被删（都在 dir 里），
+         被截掉的只是列表接口返回的条数。 */
+      const limit = Math.trunc(Number(readSettings().system.checkpointLimit ?? 200));
+      const args = ['log', '--pretty=format:%H|%ct|%s'];
+      if (Number.isFinite(limit) && limit > 0) args.push('-n', String(limit));
+      const out = await R(g, ...args);
       const items: Checkpoint[] = [];
       for (const line of out.split('\n')) {
         const [sha, ct, ...rest] = line.split('|');
@@ -390,6 +673,17 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
           ...(meta?.beforeRestore ? { beforeRestore: true } : {}),
         });
       }
+      /* 最新那一条的增删行数**永远填不上**（它靠"下一笔快照"回填，而它就是最后一笔）。
+         于是刚改完文件时面板会显示 +0−0，看起来像"没改动"——用户会以为没记上。
+         这里用现成的 show()（工作树 vs 它）给最新一条补算，口径与点开看的 diff 完全一致。 */
+      const head = items[0];
+      if (head && head.added === undefined) {
+        const s = await show(head.id);
+        if (s.stat.files) {
+          head.added = s.stat.added;
+          head.removed = s.stat.removed;
+        }
+      }
       return items;
     } catch {
       return [];
@@ -404,7 +698,7 @@ function makeRepo(sessionId: string, cwd: string): CheckpointRepo {
     }
   }
 
-  return { sessionId, cwd, snapshot, restore, diff, hasChanges, list, dispose };
+  return { sessionId, cwd, snapshot, restore, diff, show, hasChanges, list, dispose };
 }
 
 /* ────────────────────────── 小工具 ────────────────────────── */
@@ -415,12 +709,153 @@ function rel(cwd: string, p: string): string {
   return r.startsWith('..') ? abs : r;
 }
 
+/**
+ * 一次改动涉及的工作目录相对路径（快照的作用范围）。
+ *
+ * 传入的是绝对路径（工具的 resolve 结果）。落在工作目录**之外**的路径直接丢弃：
+ * 影子仓库的 work-tree 就是工作目录，外面的文件 git 管不着，
+ * 混进来只会让 `git add` 报"路径在仓库外"。
+ * 一个都没有时返回空数组 —— 调用方据此跳过这次快照，而不是退化成全树扫描。
+ */
+function scopeOf(cwd: string, files: string[]): string[] {
+  const out: string[] = [];
+  for (const f of files ?? []) {
+    if (!f) continue;
+    const r = rel(cwd, String(f));
+    if (!r || r.startsWith('..') || path.isAbsolute(r)) continue;
+    out.push(r);
+  }
+  return [...new Set(out)];
+}
+
+/** "动过的路径"清单的上限：够用（远超一次工具调用）又不会让元数据无限膨胀 */
+const TOUCHED_MAX = 400;
+
+/** 强制跟踪单个文件的大小上限（影子仓库要小；再大的东西是产物，不是"改动"） */
+const FORCE_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 哪些路径**永远不许**强制跟踪：影子仓库自己、`.git`。
+ *
+ * 这两处一旦进了索引，快照就会自我引用（git 目录里的内容每次都在变），仓库会失控。
+ */
+function forceAllowed(cwd: string, p: string): boolean {
+  const r = rel(cwd, p).split(path.sep).join('/');
+  if (!r || r.startsWith('..')) return false;
+  if (r.split('/').includes('.git')) return false;
+  const relCp = path.relative(cwd, CHECKPOINTS_DIR).split(path.sep).join('/');
+  if (relCp && !relCp.startsWith('..') && (r === relCp || r.startsWith(`${relCp}/`))) return false;
+  return true;
+}
+
 function parseNumstat(out: string): { files: number; added: number; removed: number } {
   const list = parseList(out);
   return list.reduce(
     (acc, it) => ({ files: acc.files + 1, added: acc.added + it.added, removed: acc.removed + it.removed }),
     { files: 0, added: 0, removed: 0 },
   );
+}
+
+/**
+ * 统一 diff 文本 → 结构化逐行数据（界面的 GitHub 风格视图靠它）。
+ *
+ * 为什么不在前端解析：diff 的边界情况都在细节里（`\ No newline at end of file`、
+ * 重命名只有 `--- a/old` `+++ b/new`、二进制文件只有一句 `Binary files … differ`、
+ * 路径里带空格与引号、hunk 头的 `@@ -1,2 +3,4 @@` 里计数可省略）。
+ * 放服务端解析一次，前端只管画 —— 并且和 `text` 是同一份 diff，不会两边不一致。
+ */
+export function parseUnifiedDiff(text: string): DiffFile[] {
+  const files: DiffFile[] = [];
+  let cur: DiffFile | null = null;
+  let oldNo = 0;
+  let newNo = 0;
+  /** 只在 hunk 里认内容行：`diff` 头与文件头之间的空行不能被当成上下文 */
+  let inHunk = false;
+  const lines = String(text ?? '').split('\n');
+  /* 去掉末尾那个空串：`"a\n"` 分割出来是 `['a','']`，那个 '' 是换行符的残影，
+     不是文件里的一行 —— 不删就会在 diff 末尾多出一条 newNo 越界的假上下文行。 */
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    if (line.startsWith('diff --git ')) {
+      // 新文件块开始。路径以头部为准，`---`/`+++` 只用来补重命名
+      const m = /^diff --git (.+) (.+)$/.exec(line);
+      cur = { path: unquoteGitPath(m?.[2] ?? ''), added: 0, removed: 0, binary: false, lines: [] };
+      files.push(cur);
+      inHunk = false;
+      continue;
+    }
+    if (!cur) continue; // 头部的杂项（git 版本之类的噪声）直接丢
+    if (line.startsWith('index ') || line.startsWith('old mode') || line.startsWith('new mode') || line.startsWith('similarity index')) continue;
+    if (line.startsWith('new file mode')) continue;
+    if (line.startsWith('deleted file mode')) continue;
+    if (line.startsWith('rename from ')) {
+      cur.oldPath = unquoteGitPath(line.slice('rename from '.length));
+      continue;
+    }
+    if (line.startsWith('rename to ')) {
+      cur.path = unquoteGitPath(line.slice('rename to '.length));
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      const p = unquoteGitPath(line.slice(4));
+      if (p === '/dev/null') cur.oldPath = undefined;
+      else if (!cur.oldPath) cur.oldPath = stripAbPrefix(p);
+      continue;
+    }
+    if (line.startsWith('+++ ')) {
+      const p = unquoteGitPath(line.slice(4));
+      if (p !== '/dev/null') cur.path = stripAbPrefix(p);
+      continue;
+    }
+    if (line.startsWith('Binary files ') || line.startsWith('GIT binary patch')) {
+      cur.binary = true;
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      // `@@ -a,b +c,d @@`；计数可省略，默认 1
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      oldNo = Number(m?.[1] ?? 0);
+      newNo = Number(m?.[2] ?? 0);
+      inHunk = true;
+      continue;
+    }
+    if (line.startsWith('\\')) continue; // `\ No newline at end of file`：元信息，不占行
+    if (!inHunk) continue;
+    // 内容行：三种前缀都要当"有内容"处理（空行是 ` ` 或 `+`/`-` 后面什么都没有）
+    if (line.startsWith('+')) {
+      cur.lines.push({ oldNo: null, newNo: newNo++, kind: 'add', text: line.slice(1) });
+      cur.added += 1;
+      continue;
+    }
+    if (line.startsWith('-')) {
+      cur.lines.push({ oldNo: oldNo++, newNo: null, kind: 'del', text: line.slice(1) });
+      cur.removed += 1;
+      continue;
+    }
+    if (line.startsWith(' ') || line === '') {
+      cur.lines.push({ oldNo: oldNo++, newNo: newNo++, kind: 'ctx', text: line.slice(1) });
+    }
+  }
+  /* `--- a/x` / `+++ b/x` 在**普通修改**里也是成对出现的，别把同名的两行当成重命名 ——
+     否则界面会显示"x → x"，看着像出了错。只有真不一样才留 oldPath。 */
+  for (const f of files) {
+    if (f.oldPath === f.path) delete f.oldPath;
+  }
+  return files;
+}
+
+/** git 里带特殊字符的路径会整体加双引号并转义 —— 这里的路径用于显示与 `--` 匹配，去掉引号即可 */
+function unquoteGitPath(p: string): string {
+  const s = p.trim();
+  if (s.startsWith('"') && s.endsWith('"') && s.length > 1) {
+    return s.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  return s;
+}
+
+function stripAbPrefix(p: string): string {
+  return p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p;
 }
 
 function parseList(out: string): Array<{ path: string; added: number; removed: number }> {

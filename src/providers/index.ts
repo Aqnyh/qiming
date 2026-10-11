@@ -76,7 +76,34 @@ export function errorText(status: number, body: string): string {
   const head = 'HTTP ' + status;
   const why = friendlyReason(status);
   const detail = pickMessage(body);
-  return head + (why ? '：' + why : '') + (detail ? '｜' + detail : '');
+  return head + (why ? '：' + why : '') + (detail ? '｜' + detail : '') + hintFor(status, body);
+}
+
+/**
+ * 有些上游的 400 正文**只有模型名**（实测 opencode Go 网关：`{"model":"deepseek-v4.1-flash"}`），
+ * 一个字都不提哪里错了，光看文案根本没法归因（2026-10-10 因此白查了一轮）。
+ * 它的真实含义是**请求体的消息序列畸形**——已用真实网关逐项复现确认：
+ *   · assistant 带 tool_calls 却没有配对的 tool 结果
+ *   · 同一条 / 跨消息的 tool_call id 重复
+ *   · tool 结果排在不对应的 assistant 之后（顺序错乱）
+ * 这里补一句人话提示，把「模型名」这个误导性线索翻译成可行动的方向。
+ */
+function hintFor(status: number, body: string): string {
+  if (status !== 400) return '';
+  const txt = String(body ?? '').trim();
+  if (!txt.startsWith('{')) return '';
+  try {
+    const j: unknown = JSON.parse(txt);
+    if (!isObj(j)) return '';
+    const keys = Object.keys(j);
+    const onlyModel = keys.length === 1 && typeof j.model === 'string';
+    if (onlyModel) {
+      return '（上游只说"模型"这一项，实为**消息序列畸形**：检查 assistant 的 tool_calls 是否都有配对的 tool 结果、id 有无重复）';
+    }
+  } catch {
+    return '';
+  }
+  return '';
 }
 
 /** 哪些 HTTP 状态值得重试：5xx（服务端抽风）/ 429（限流）/ 408（上游超时）。

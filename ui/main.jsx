@@ -13,6 +13,8 @@ import Sidebar from './features/Sidebar.jsx';
 import ChatView from './features/ChatView.jsx';
 import SettingsDrawer from './features/SettingsDrawer.jsx';
 import DownloadsDialog from './features/DownloadsDialog.jsx';
+import AuditDialog from './features/AuditDialog.jsx';
+import ChangesPanel, { ChangesDrawer } from './features/ChangesPanel.jsx';
 import { Icon, Spinner, Toast } from './features/ui.jsx';
 
 function Splash({ text }) {
@@ -55,6 +57,8 @@ function App() {
       </div>
       {st.drawer.open ? <SettingsDrawer /> : null}
       {st.downloads ? <DownloadsDialog /> : null}
+      {st.auditOpen ? <AuditDialog /> : null}
+      {st.changesOpen ? <ChangesDrawer /> : null}
       <Toast toast={st.toast} />
     </div>
   );

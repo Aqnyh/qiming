@@ -16,7 +16,7 @@
  */
 import { chat as providerChat } from '../providers/index.ts';
 import type { ChatMessage, ProviderConfig, StreamEvent, ToolCall, ToolDef } from '../providers/types.ts';
-import type { ModelParams } from '../store/settings.ts';
+import type { ModelParams, SystemSettings } from '../store/settings.ts';
 import type { Logger } from '../util/log.ts';
 
 const NUDGE_MAX = 2;
@@ -33,6 +33,16 @@ const TRUNC_MAX = 3;
 
 export type RoundInfo = {
   round: number;
+  /**
+   * turn = 由**用户输入**划出的一段（一次提问 / 一次插话 = 新的 turn）；
+   * step = 由**一次模型调用**划出的一步（工具回灌后再算下一步）。
+   *
+   * 为什么分开：`round` 一个数此前扛了所有事 —— "用户又插了一句"和"模型又调了一次工具"
+   * 在界面上分不清。分开后插话挂靠点清晰（steer/urgent 注入即开新 turn、step 归零），
+   * 与主流 harness（dsh 的 turn/step）对齐。
+   */
+  turn: number;
+  step: number;
   content: string;
   thinking: string;
   calls: ToolCall[];
@@ -51,19 +61,24 @@ export type LoopEvents = {
   onRound: (info: RoundInfo) => void;
   /** 循环自己产生的一句提示（会同时发给界面并回灌给模型） */
   onNotice: (notice: LoopNotice, rendered: string) => void;
-  /** 取出待注入的用户插话（轮次边界调用） */
+  /** 取出待注入的用户插话（安全点调用：模型调用后 / 每次工具调用返回后 / 工具批次后） */
   takeSteering: () => string[];
-  /** 取出"立即执行"的话（打断当前调用后立刻注入） */
+  /** 取出"打断"的话（掐掉当前调用或工具之后立刻注入） */
   takeUrgent: () => string[];
-  /** 每次模型调用开始：宿主拿到中断把手（用户点「立即执行」时掐掉这一次调用） */
+  /** 每次模型调用开始：宿主拿到中断把手（用户点「打断」时掐掉这一次调用） */
   onCallStart?: (ac: AbortController) => void;
+  /** 每次工具调用开始：宿主拿到"掐这个工具"的把手（打断语义要连工具一起掐） */
+  onToolStart?: (ac: AbortController) => void;
   /** 渲染循环文案 */
   render: (id: string, vars?: Record<string, string>) => string;
 };
 
 export type LoopInput = {
   cfg: ProviderConfig;
+  /** 模型调用参数（temperature/maxTokens/超时/重试…），设置 → 模型 */
   params: ModelParams;
+  /** 系统参数（停滞看门狗/自动续跑…），设置 → 系统 */
+  sys: SystemSettings;
   system: string;
   /** 请求视图（本函数会往里追加本轮产生的消息） */
   history: ChatMessage[];
@@ -72,12 +87,15 @@ export type LoopInput = {
   /**
    * 执行一次工具调用。`at` = 这次调用出现在正文里的字符偏移（本轮正文写完时的累计长度）——
    * 宿主拿它记进调用记录，界面据此把媒体/文件卡插到正确的位置。
+   * `toolSignal` 是**这一个工具**的掐断把手（用户打断时宿主掐它，与整段运行的 signal 分开：
+   * 掐断不该把整段运行判死，见 loop.ts 的 executeTools）。
    */
   runTool: (
     call: ToolCall,
     seq: number,
     at: number,
-  ) => Promise<{ ok: boolean; text: string; images?: Array<{ mime: string; data: string }> }>;
+    toolSignal: AbortSignal,
+  ) => Promise<ToolExecResult>;
   /** 该工具是否独占外部资源（屏幕/浏览器/写文件/命令）—— 独占的串行跑，其余并行 */
   isExclusive: (name: string) => boolean;
   events: LoopEvents;
@@ -94,21 +112,32 @@ export type LoopResult = {
   finalText: string;
 };
 
+/** 一次工具调用的结果（走 host 的 runTool） */
+type ToolExecResult = { ok: boolean; text: string; images?: Array<{ mime: string; data: string }>; errorCode?: string };
+
 export async function runLoop(input: LoopInput): Promise<LoopResult> {
-  const { cfg, params, events, log, signal } = input;
+  const { cfg, params, sys, events, log, signal } = input;
   const history = input.history;
   let seq = 0;
   let nudges = 0;
   const maxRetries = Math.max(0, Number(params.retryCount ?? 2));
   let retriesLeft = maxRetries;
   /** 自动续跑（默认关）：重试预算用完后还接着试几次，让"上游抽风"不需要人工再发一句 */
-  const maxAutoContinues = params.autoContinue ? Math.max(0, Number(params.autoContinueMax ?? 2)) : 0;
+  const maxAutoContinues = sys.autoContinue ? Math.max(0, Number(sys.autoContinueMax ?? 2)) : 0;
   let autoContinuesLeft = maxAutoContinues;
   /** 停滞看门狗：这么久没有任何字节就中止本次调用（0 = 关） */
-  const stallSec = Math.max(0, Number(params.stallSec ?? 90));
+  const stallSec = Math.max(0, Number(sys.stallSec ?? 90));
   let interruptStreak = 0;
   let truncStreak = 0;
   let finalText = '';
+  /**
+   * turn/step 计数（见 RoundInfo 的说明）：
+   *  · turn 在**用户输入**处 +1（开跑算 turn 1；每次插话/打断注入算新的一 turn）；
+   *  · step 是当前 turn 内的模型调用序号。
+   * 两者都随事件发出去，界面既能显示"总共第几步"，也能显示"这一段里的第几步"。
+   */
+  let turn = 1;
+  let stepInTurn = 0;
   /** 循环自己产生的一句收尾文案：作为正文增量发出去（这样它既实时可见，也留在落盘的消息里） */
   const emitAside = (text: string): void => {
     if (text) events.onContentDelta(text);
@@ -121,12 +150,24 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
   for (let round = 1; round <= rounds; round++) {
     if (signal.aborted) return { ok: false, aborted: true, rounds: round - 1, finalText };
 
-    // 1) 插话注入（用户在上一步运行中说的事）
-    for (const text of events.takeSteering()) {
+    stepInTurn += 1;
+
+    // 1) 插话注入（用户在上一步运行中说的事）—— 插话 = 开一个新的 turn
+    const startSteering = events.takeSteering();
+    for (const text of startSteering) {
       const rendered = events.render('loop.steering', { text });
       history.push({ role: 'user', content: rendered });
       events.onNotice({ id: 'loop.steering', vars: { text } }, rendered);
     }
+    if (startSteering.length) {
+      turn += 1;
+      stepInTurn = 1;
+    }
+
+    /* 请求前的历史自愈（幂等）：畸形序列会让上游**整段请求** 400，
+       而症状只是一句莫名其妙的错误文案，极难归因。宁可在发出去之前修好。 */
+    const repaired = repairHistory(history);
+    if (repaired) log.warn('历史里有畸形消息序列，已自愈后再发请求', { repaired });
 
     const messages: ChatMessage[] = [{ role: 'system', content: input.system }, ...history];
     const started = Date.now();
@@ -220,14 +261,14 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
       }
     }
 
-    events.onRound({ round, content, thinking, calls, stop: stop ?? 'cut', usage, ms, aborted });
+    events.onRound({ round, turn, step: stepInTurn, content, thinking, calls, stop: stop ?? 'cut', usage, ms, aborted });
 
     if (aborted) return { ok: false, aborted: true, rounds: round, finalText: finalText || content };
 
-    /* ★ 立即执行（urgent）优先于一切后续处理：
-       用户点了"立即执行"，服务端掐掉了上面这次调用 —— 不执行（可能不完整的）工具调用、
+    /* ★ 打断（urgent）优先于一切后续处理：
+       用户点了「打断」，服务端掐掉了上面这次调用 —— 不执行（可能不完整的）工具调用、
        不按超时/报错处理，直接把已经生成的内容留档，注入新指令，马上开下一轮。
-       这是 Codex instant_interrupt / Claude Code 里"Esc + 新指令"的等价物。 */
+       这是 Codex 的 interrupt / Claude Code 里"Esc + 新指令"的等价物。 */
     const urgent = events.takeUrgent();
     if (urgent.length) {
       if (content.trim() || thinking.trim()) {
@@ -244,6 +285,7 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
         events.onNotice({ id: 'loop.steering_urgent', vars: { text } }, rendered);
       }
       nudges = 0;
+      turn += 1; // 用户打断 = 新的 turn
       continue;
     }
 
@@ -326,6 +368,15 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
     // 3) 无工具调用：要么是最终回答，要么需要追问
     if (!calls.length) {
       if (content.trim()) {
+        /* ★ 插话安全点：**模型调用之后**。
+           用户在模型出字期间补的那句话，在这里注入 —— 不打断已经吐完的这一轮，
+           但也不让它成为"最终回答"（否则用户的话要等下一段运行才有人理，那就成了"排队"）。
+           注入后 continue：下一轮模型就能看到新指令。 */
+        if (injectSteering()) {
+          history.push({ role: 'assistant', content });
+          nudges = 0;
+          continue;
+        }
         finalText = content;
         return { ok: true, aborted: false, rounds: round, finalText };
       }
@@ -359,6 +410,13 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
       const rendered = events.render('loop.truncated');
       events.onNotice({ id: 'loop.truncated' }, rendered);
       history.push({ role: 'assistant', content, ...(thinking ? { thinking, thinkingSig } : {}), toolCalls: calls });
+      /* ★ 截断的这批调用**不执行**，但 assistant 消息里的 toolCalls 必须逐个有对应的 tool 结果，
+         否则下一轮请求就是「带 tool_calls 却无配对」的畸形历史 → 上游直接 400
+         （实测 opencode 网关回 {"model":"…"}，见 2026-10-10 的复盘）。
+         这里补的是"没执行"的说明，既满足配对约束，也让模型知道这批调用没跑。 */
+      for (const call of calls) {
+        history.push({ role: 'tool', toolCallId: call.id, content: '（上一轮输出被截断，这次调用没有执行。请把参数拆小重新发起。）' });
+      }
       history.push({ role: 'user', content: rendered });
       continue;
     }
@@ -375,7 +433,29 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
 
     // 本轮正文已写完：这一轮的调用就出现在这个位置之后
     textSoFar += content;
-    const results = await executeCalls(calls, textSoFar.length);
+    const { results, urgent: urgentDuringTools } = await executeTools(calls, textSoFar.length);
+    if (urgentDuringTools.length) {
+      /* 工具跑到一半被用户打断：把**已经执行过的**工具结果留在历史里（模型需要知道
+         "哪些做了、哪些没做"），然后把新指令插进来，立刻开下一轮。
+
+         ⚠️ 上面第 5 步（本分支之前）**已经 push 过一条带 toolCalls 的 assistant**，
+         这里绝不能再 push 一遍 —— 两条同 id 的 tool_calls 会拼出畸形历史，上游直接 400
+         （实测 opencode 网关回 {"model":"…"}；2026-10-10 那次运行就是这么终结的）。 */
+      for (const call of calls) {
+        const r = results.get(call.id);
+        history.push({ role: 'tool', toolCallId: call.id, content: r ? r.text : '（用户打断，这次调用没有执行。）', ...(r?.images?.length ? { images: r.images } : {}) });
+      }
+      /* 打断的那一批工具**不再算作正文的一部分**（下面给正文补的分隔符也不加了）：
+         它们的结果是"被打断"的残局，接在正文后面只会让叙述断裂。 */
+      for (const text of urgentDuringTools) {
+        const rendered = events.render('loop.steering_urgent', { text });
+        history.push({ role: 'user', content: rendered });
+        events.onNotice({ id: 'loop.steering_urgent', vars: { text } }, rendered);
+      }
+      nudges = 0;
+      turn += 1; // 工具批次中被打断 = 新的 turn
+      continue;
+    }
     /* 轮与轮之间空一行：消息正文是所有轮拼起来的，不留空行会粘成一坨。
        注意 textSoFar 要跟着加上这个分隔符 —— 否则下一轮卡片的偏移会差 2 个字符。 */
     if (content.trim()) {
@@ -401,36 +481,216 @@ export async function runLoop(input: LoopInput): Promise<LoopResult> {
   return { ok: true, aborted: false, rounds, finalText: cap };
 
   /* ────────── 工具执行：独占类串行，其余并行 ────────── */
-  async function executeCalls(
+
+  /**
+   * 执行一批工具调用。
+   *
+   * 这里有两个**安全点**，都是插话语义的落点：
+   *   1. 批内串行跑时，**每次工具返回后**注入（用户在两分钟的命令跑到一半时补的那句话，
+   *      下一件工具就能按新方向做 —— 不用等整批跑完）。并行批次没有中间态，只在批后注入。
+   *   2. 批后注入（所有工具都跑完）。
+   * 打断（urgent）会掐掉正在跑的工具，并把它的结果标成"被用户打断"，模型看得到。
+   */
+  async function executeTools(
     list: ToolCall[],
     at: number,
-  ): Promise<Map<string, { ok: boolean; text: string; images?: Array<{ mime: string; data: string }> }>> {
-    const out = new Map<string, { ok: boolean; text: string; images?: Array<{ mime: string; data: string }> }>();
+  ): Promise<{
+    results: Map<string, ToolExecResult>;
+    /** 批次里发生的打断：非空表示用户掐了这次运行，调用方要立刻转向 */
+    urgent: string[];
+  }> {
+    const results = new Map<string, ToolExecResult>();
     const jobs = list.map((call) => ({ call, seq: seq++ }));
     const serial = jobs.some((j) => input.isExclusive(j.call.name));
+    /** 打断工具用：正在跑的那个工具的掐断把手 */
+    let currentTool: AbortController | null = null;
+    /** 打断时取走的文本 */
+    const pendingUrgent: string[] = [];
+
+    const runOne = async (job: { call: ToolCall; seq: number }): Promise<void> => {
+      const ac = new AbortController();
+      currentTool = ac;
+      events.onToolStart?.(ac);
+      try {
+        results.set(job.call.id, await runGuarded(job.call, job.seq, at, ac.signal));
+      } finally {
+        currentTool = null;
+      }
+    };
+
+    /** 有打断就掐掉正在跑的工具并记下来 */
+    const takeUrgent = (): boolean => {
+      const urgent = events.takeUrgent();
+      if (!urgent.length) return false;
+      pendingUrgent.push(...urgent);
+      currentTool?.abort();
+      return true;
+    };
+
+    /** 还没跑的调用直接作废：告诉模型"这些没执行"，免得它以为做过 */
+    const voidPending = (): void => {
+      for (const pending of jobs) {
+        if (!results.has(pending.call.id)) {
+          results.set(pending.call.id, { ok: false, errorCode: 'ABORTED_BEFORE_DISPATCH', text: '（用户打断，这次调用没有执行。）' });
+        }
+      }
+    };
+
     if (serial || jobs.length === 1) {
-      for (const j of jobs) out.set(j.call.id, await runGuarded(j.call, j.seq, at));
-      return out;
+      for (const job of jobs) {
+        if (takeUrgent()) {
+          voidPending();
+          return { results, urgent: pendingUrgent };
+        }
+        await runOne(job);
+        // ★ 串行批内的安全点：这件工具刚跑完，插话立刻注入（下一次模型调用就能看到）
+        if (injectSteering()) return { results, urgent: [] };
+      }
+      return { results, urgent: [] };
     }
-    const settled = await Promise.all(jobs.map((j) => runGuarded(j.call, j.seq, at)));
-    jobs.forEach((j, i) => out.set(j.call.id, settled[i]!));
-    return out;
+
+    // 并行批：先看有没有已到的打断；跑完再统一注入（并行批没有中间态可以插）
+    if (takeUrgent()) {
+      voidPending();
+      return { results, urgent: pendingUrgent };
+    }
+    await Promise.all(jobs.map((j) => runOne(j)));
+    injectSteering();
+    return { results, urgent: [] };
+  }
+
+  /**
+   * 取走 steer 插话并注入历史（安全点的统一动作）。
+   * @returns 有没有注入
+   */
+  function injectSteering(): boolean {
+    const texts = events.takeSteering();
+    if (!texts.length) return false;
+    for (const text of texts) {
+      const rendered = events.render('loop.steering', { text });
+      history.push({ role: 'user', content: rendered });
+      events.onNotice({ id: 'loop.steering', vars: { text } }, rendered);
+    }
+    turn += 1; // 插话 = 新的 turn（下一次模型调用就该算新 turn 的第 1 步）
+    return true;
   }
 
   async function runGuarded(
     call: ToolCall,
     n: number,
     at: number,
-  ): Promise<{ ok: boolean; text: string; images?: Array<{ mime: string; data: string }> }> {
+    toolSignal: AbortSignal,
+  ): Promise<ToolExecResult> {
     const key = `${call.name}:${stableArgs(call.args)}`;
     const hits = repeatGuard.get(key) ?? 0;
     if (hits >= 2) {
-      return { ok: false, text: `（同一调用已成功执行过 ${hits} 次，这次跳过。换一种做法，或直接汇报结论。）` };
+      return { ok: false, errorCode: 'LOOP_GUARD', text: `（同一调用已成功执行过 ${hits} 次，这次跳过。换一种做法，或直接汇报结论。）` };
     }
-    const r = await input.runTool(call, n, at);
+    const r = await input.runTool(call, n, at, toolSignal);
     if (r.ok) repeatGuard.set(key, hits + 1);
     return r;
   }
+}
+
+/**
+ * 请求前的**历史自愈**：把畸形消息序列修正成上游能接受的样子。
+ *
+ * 为什么必须做这道闸门（2026-10-10 实战教训）：
+ * 一次「工具跑到一半被用户打断」的运行，历史里落进了**两条同 id 的 assistant(tool_calls)**
+ * （循环的打断分支重复 push），下一轮请求被网关判为畸形，回了 `HTTP 400 {"model":"…"}`
+ * —— 错误文案里没有一个字提到"消息序列"，整段运行就此终结，极难归因。
+ * 补丁修掉了产生方，但**旧会话已经落盘的历史还在**，且未来仍可能有别的路径写歪，
+ * 所以这里再加一道幂等闸门：发出去之前必须自洽。
+ *
+ * 修的三件事（都是 openai 兼容协议里明确禁止、对着 opencode 网关实测必 400 的形态）：
+ *  1. assistant 带 toolCalls → 其后必须紧跟这批调用**全部**的 tool 结果；缺的补"没执行"，
+ *     多出来的孤儿 tool 消息删掉；
+ *  2. tool_call id 不能重复（同一条消息内重复 / 跨消息撞车都算）；
+ *  3. 空 assistant（既没正文也没调用）发出去必 400，删掉。
+ *
+ * ⚠️ **不要**顺手合并相邻的同角色消息。实测（2026-10-10，对真实网关）：
+ * 「连续两条 user」「相邻两条 assistant」都返回 200，根本不是问题；
+ * 而合并会把循环注入的重试/续跑提示跟用户原话搅在一起，破坏"按消息形态判定场景"的逻辑
+ * （e2e 的 429 重试用例就是这么被误伤的）。自愈只修**确证会 400** 的形态。
+ *
+ * @returns 修正了几处（0 = 历史本来就干净）
+ */
+export function repairHistory(history: ChatMessage[]): number {
+  let fixed = 0;
+  const out: ChatMessage[] = [];
+  /** 已经声明过 tool_calls id 的集合（跨消息判重：同 id 出现两次也是畸形） */
+  const usedCallIds = new Set<string>();
+
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
+
+    /* ① assistant 的 tool_calls：去重 id + 补齐 tool 结果 */
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+      const calls: ToolCall[] = [];
+      for (const c of m.toolCalls) {
+        // 同一条消息里重复的 id、或历史里已经用过的 id → 只留第一份
+        if (!c.id || usedCallIds.has(c.id)) {
+          fixed += 1;
+          continue;
+        }
+        usedCallIds.add(c.id);
+        calls.push(c);
+      }
+
+      /* 后面必须紧跟这批调用的全部 tool 结果；跟到别的消息就说明缺了 */
+      const ids = new Set(calls.map((c) => c.id));
+      let j = i + 1;
+      const tools: ChatMessage[] = [];
+      while (j < history.length && history[j].role === 'tool') {
+        const t = history[j];
+        if (t.toolCallId && ids.has(t.toolCallId)) {
+          ids.delete(t.toolCallId);
+          tools.push(t);
+        } else {
+          fixed += 1; // 孤儿 tool 结果（没有对应调用）→ 丢
+        }
+        j += 1;
+      }
+      i = j - 1;
+
+      /* 调用被去重光了、正文也空 → 这条 assistant 整个没意义，别留着惹上游 */
+      if (!calls.length && !m.content.trim()) {
+        fixed += 1;
+        continue;
+      }
+      out.push(calls.length ? { ...m, toolCalls: calls } : { ...m, toolCalls: undefined });
+      out.push(...tools);
+      for (const missing of ids) {
+        out.push({ role: 'tool', toolCallId: missing, content: '（这次调用没有执行。）' });
+        fixed += 1;
+      }
+      continue;
+    }
+
+    /* ② 孤立的 tool 消息（前面没有带对应调用的 assistant）→ 丢 */
+    if (m.role === 'tool') {
+      if (!m.toolCallId || !usedCallIds.has(m.toolCallId)) {
+        fixed += 1;
+        continue;
+      }
+      out.push(m);
+      continue;
+    }
+
+    /* ③ 空 assistant（既没正文也没调用）发出去必 400 → 丢 */
+    if (m.role === 'assistant' && !m.content.trim() && !m.toolCalls?.length) {
+      fixed += 1;
+      continue;
+    }
+
+    out.push(m);
+  }
+
+  if (fixed) {
+    history.length = 0;
+    history.push(...out);
+  }
+  return fixed;
 }
 
 /**

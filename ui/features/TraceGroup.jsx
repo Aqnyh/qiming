@@ -80,6 +80,12 @@ function CallRow({ call, runId }) {
           </span>
         ) : null}
         {call.chars ? <span className="shrink-0 text-[10.5px] tabular-nums text-subtle">{fmtChars(call.chars)}</span> : null}
+        {call.errorCode ? <span className="shrink-0 rounded border border-danger/40 px-1 text-[10px] font-mono text-danger" title="标准错误码（按它分类，不靠文案猜）">{call.errorCode}</span> : null}
+        {call.spill ? (
+          <span className="shrink-0 text-[10.5px] tabular-nums text-accent" title={`全文已落盘：${call.spill.path}`}>
+            全文落盘 {fmtChars(call.spill.chars)}
+          </span>
+        ) : null}
         {call.ms ? <span className="shrink-0 text-[10.5px] tabular-nums text-subtle">{fmtDuration(call.ms)}</span> : null}
         {call.subRunId ? <Badge tone="accent">子智能体</Badge> : null}
       </button>
@@ -105,6 +111,18 @@ function CallRow({ call, runId }) {
                   {detail.text || '（没有输出）'}
                 </pre>
               </div>
+              {call.spill ? (
+                <div>
+                  <p className="mb-1 text-[10.5px] text-subtle">完整结果已落盘（回灌给模型的是头尾预览）</p>
+                  <div className="flex items-center gap-1.5 rounded-md border border-line/60 bg-bg/70 px-2 py-1.5">
+                    <Icon name="file" className="size-3.5 shrink-0 text-muted" />
+                    <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted" title={call.spill.path}>
+                      {call.spill.path}
+                    </code>
+                    <span className="shrink-0 text-[10.5px] tabular-nums text-subtle">{fmtChars(call.spill.chars)}</span>
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>

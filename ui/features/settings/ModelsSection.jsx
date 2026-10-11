@@ -1,24 +1,22 @@
 /**
- * ui/features/settings/ModelsSection.jsx —— 模型与参数。
+ * ui/features/settings/ModelsSection.jsx —— 模型：服务商 + **模型调用本身**的采样参数。
  *
  * 服务商是**整份提交**的（POST /api/settings {providers:[...]}），服务端按 id 合并：
  * apiKey 传空串/不传 = 保持原值（界面只显示 keyHint 掩码），传 null = 清除。
  * 所以编辑器以服务端返回的脱敏数据为底稿，只把用户真填的新 key 带上（"留空=不改"）。
  *
- * 项目（工作目录）已独立成「设置 → 项目」板块（需求 3）：这里只管模型与采样参数。
+ * **这一页只管"发给上游那次请求"的东西**（服务商、temperature/maxTokens/超时/重试/
+ * 上下文窗口/思考预算）。属于"智能体怎么跑"的系统参数（轮次上限、并发、spill、
+ * 检查点条数、排队默认…）在「设置 → 系统」（SystemSection.jsx）——2026-10-10 第十一轮归一。
  */
 import { useEffect, useState } from 'react';
 import { api } from '../../state/api.js';
 import { useApp, patch, toast } from '../../state/store.js';
 import { Badge, Btn, Field, Icon, Input, Section, Select, Spinner, Toggle } from '../ui.jsx';
 
+/** 模型调用参数：随每次上游请求发出去 / 影响单次请求。 */
 const PARAM_FIELDS = [
   { key: 'temperature', name: 'temperature', desc: '采样温度', step: 0.1 },
-  // 上游鲁棒性（见 ARCHITECTURE「上游故障的应对」）：
-  // stallSec 是"连上了但一个字节都不吐"的看门狗；autoContinue 是重试预算用完后还接着试（默认关）
-  { key: 'stallSec', name: 'stallSec', desc: '上游停滞多久算卡住（秒，0=关）', step: 1 },
-  { key: 'autoContinue', name: 'autoContinue', desc: '重试预算用完后自动续跑', kind: 'bool' },
-  { key: 'autoContinueMax', name: 'autoContinueMax', desc: '自动续跑最多几次', step: 1 },
   { key: 'maxTokens', name: 'maxTokens', desc: '单次回答上限', step: 1 },
   { key: 'thinkingBudget', name: 'thinkingBudget', desc: '扩展思考预算（token，0 = 关）', step: 1 },
   { key: 'callTimeoutSec', name: 'callTimeoutSec', desc: '单次模型调用超时（秒）', step: 1 },
@@ -195,10 +193,10 @@ export default function ModelsSection() {
         </div>
       </Section>
 
-      {/* ─── 采样参数 ─── */}
+      {/* ─── 采样参数（只留模型调用相关的） ─── */}
       <Section
-        title="采样与运行参数"
-        desc="对全部服务商生效；thinkingBudget 只在支持的协议上起作用（Anthropic 扩展思考等）。"
+        title="模型调用参数"
+        desc="对全部服务商生效；thinkingBudget 只在支持的协议上起作用（Anthropic 扩展思考等）。系统级参数（轮次、并发、落盘…）在「设置 → 系统」。"
         actions={
           <Btn size="sm" variant="primary" disabled={busy || !params} onClick={() => void saveParams()}>
             {busy ? <Spinner className="size-3" /> : null}

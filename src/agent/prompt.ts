@@ -37,7 +37,7 @@ export function assembleSystem(input: SystemInput): string {
   const p = input.prompts;
   const blocks: string[] = [];
 
-  for (const id of ['system.base', 'system.output', 'system.tools', 'system.modules']) {
+  for (const id of ['system.base', 'system.output', 'system.tools', 'system.modules', 'system.self']) {
     if (!p.enabled(id)) continue;
     const t = p.text(id).trim();
     if (t) blocks.push(t);

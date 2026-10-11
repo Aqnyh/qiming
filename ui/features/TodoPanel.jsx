@@ -29,7 +29,7 @@ export default function TodoPanel() {
   const done = items.filter((i) => i.status === 'done').length;
 
   return (
-    <aside className="ml-5 hidden w-64 shrink-0 flex-col py-2 sm:flex" aria-label="待办清单">
+    <aside className="flex min-h-0 flex-1 flex-col" aria-label="待办清单">
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-line bg-card/95">
         <div className="flex shrink-0 items-center gap-1.5 border-b border-line px-2 py-1.5">
           <Icon name="clipboard" className="size-3.5 text-accent" />

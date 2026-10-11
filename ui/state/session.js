@@ -299,6 +299,10 @@ export async function loadActive(id = state.activeId) {
     queue: { ...state.queue, [id]: Array.isArray(data.queue) ? data.queue : [] },
     // 上下文占用：不跑的时候也要有数（服务端按同一口径算的静态快照）
     ...(data.usage ? { usage: { ...state.usage, [id]: data.usage } } : {}),
+    // 文件改动：刷新后"改过哪些文件"仍在（右列面板读它）
+    ...(Array.isArray(data.changes) ? { changes: { ...state.changes, [id]: data.changes } } : {}),
+    // 压缩替换节点：刷新后"哪段历史被摘要替掉了"仍可见、可撤回
+    ...(Array.isArray(data.compact) ? { compact: { ...state.compact, [id]: data.compact } } : {}),
   });
   void refreshTodo(id);
 }
@@ -323,6 +327,20 @@ export function setCurrentProject(id) {
   });
 }
 
+/* ────────────────────────── 压缩替换节点（可见 + 可撤回） ────────────────────────── */
+
+/** 撤回一个压缩节点：那段历史回到请求视图（原文一直在会话文件里，没有丢） */
+export async function removeCompactNode(nodeId, sessionId = state.activeId) {
+  if (!sessionId) return;
+  try {
+    const r = await api(`/api/session/${encodeURIComponent(sessionId)}/compact?node=${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+    patch({ compact: { ...state.compact, [sessionId]: Array.isArray(r.nodes) ? r.nodes : [] } });
+    toast('已撤回该压缩节点（那段原历史重新进入请求视图）', 'ok');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
 export async function refreshTodo(sessionId = state.activeId) {
   if (!sessionId) {
     patch({ todo: null });
@@ -336,17 +354,58 @@ export async function refreshTodo(sessionId = state.activeId) {
   }
 }
 
+/* ────────────────────────── 文件改动（比对与撤回） ────────────────────────── */
+
+/** 拉这条会话的改动清单（检查点，新→旧） */
+export async function refreshChanges(sessionId = state.activeId) {
+  if (!sessionId) return;
+  try {
+    const r = await api(`/api/session/${encodeURIComponent(sessionId)}`);
+    if (state.activeId !== sessionId) return; // 期间用户切走了
+    patch({ changes: { ...state.changes, [sessionId]: Array.isArray(r.changes) ? r.changes : [] } });
+  } catch {
+    /* 改动清单拉不到不影响聊天 */
+  }
+}
+
+/**
+ * 撤回到某个检查点 —— **破坏性操作**，所以：
+ *  1. 先让用户确认（会话在跑时服务端会直接拒绝，这里也先拦一道）；
+ *  2. 撤完重拉清单（撤回本身也会留下一条新快照，历史只增不减）。
+ */
+export async function restoreCheckpoint(checkpoint, sessionId = state.activeId) {
+  if (!sessionId) return false;
+  if (state.runs[sessionId]) {
+    toast('会话正在运行：先停止，再撤回（否则模型可能立刻又写回去）。', 'error');
+    return false;
+  }
+  if (!askConfirm(`撤回到这一步之前的样子？\n\n· 这一步之后改的文件会被还原\n· 这一步之后新建的文件会被删除\n\n（撤回本身也会记一笔，可以再撤回来）`)) return false;
+  try {
+    const r = await api('/api/changes/restore', { method: 'POST', body: { sessionId, checkpoint } });
+    toast(r.detail ?? '已撤回', 'ok');
+    await refreshChanges(sessionId);
+    await loadActive(sessionId); // 文件变了，让界面上的文件卡/详情重新对齐
+    return true;
+  } catch (err) {
+    toast(err.message, 'error');
+    return false;
+  }
+}
+
 /* ────────────────────────── 发送 / 停止 ────────────────────────── */
 
 /**
- * 发消息。运行中发的一律**先排队**（标准做法：Codex 的 Enter 入队、Claude Code 的打字排队）：
- * 排队条显示在输入框上方，**不进消息区**（没执行就不该出现在对话里）；
- * 用户可以逐条「立即执行」（打断当前模型调用，插到最前）或删除；
- * 这一轮跑完还没被单独处理的，服务端会自动接着执行（轮次边界注入 + 运行结束自动续队）。
+ * 发消息。运行中发的一律**先收进队列**，三种语义由 `mode` 决定（见 run-types.ts 的 SteerMode）：
+ *   · 不传 `mode` → **服务端用系统参数里的默认**（设置 → 系统 → queueDefault，默认 `queue`
+ *     = 这一轮跑完自动接着执行）；这是"运行中再发一句"的常规行为。
+ *   · `steer`（插话）—— 当前轮次的安全点注入，不打断；
+ *   · `urgent`（立即执行）—— 掐掉当前模型调用/工具，立刻转向（**唯一在当前轮次内反馈**的做法）。
+ * 排队条显示在输入框上方，**不进消息区**（没执行就不该出现在对话里）。
  */
-export async function send(text, mode = 'steer') {
-  const body = { text: String(text ?? '').trim(), mode };
+export async function send(text, mode) {
+  const body = { text: String(text ?? '').trim() };
   if (!body.text) return false;
+  if (mode) body.mode = mode; // 不传 = 让服务端按系统默认决定
   const activeId = state.activeId;
   if (activeId) body.sessionId = activeId;
   else body.projectId = state.currentProjectId || null;
@@ -364,9 +423,16 @@ export async function send(text, mode = 'steer') {
   }
   const sid = r.sessionId;
   if (r.steered) {
-    // 排队：只进"排队条"，不插消息气泡（执行时服务端会发 msg 事件，那时才出现在对话里）
+    // 收进队列：只进"排队条"，不插消息气泡（执行时服务端会发 msg 事件，那时才出现在对话里）
     upsertQueued(sid, r.item ?? { id: uid('q'), text: body.text, ts: Date.now(), mode: r.mode ?? 'steer' });
-    toast('已排队：这一轮跑完自动执行；可在输入框上方「立即执行」或删除', 'ok');
+    toast(
+      r.mode === 'queue'
+        ? '已排队：这一段运行跑完按顺序执行；可单条「立即执行」打断'
+        : r.mode === 'urgent'
+          ? '已请求打断：掐掉当前调用/工具后立刻转向'
+          : '已插话：下一个安全点（每次工具跑完/模型调用后）就交给模型',
+      'ok',
+    );
     return true;
   }
   // 正常发送：先乐观插一条用户消息（服务端的 msg 事件到达时换成正身；若它已经先到了就不再插）
@@ -436,14 +502,48 @@ export async function stopRun(sessionId = state.activeId) {
 
 /* ────────────────────────── 抽屉与浮层的开合 ────────────────────────── */
 
+/**
+ * 把"当前开着哪个抽屉"写到 <html data-drawer>。
+ * 为什么不用 React 渲染：手机上的两枚按键（会话 / 设置）是**兄弟节点**，
+ * 要互斥就得让一个知道另一个的状态；写到一个 DOM 属性上，既让 CSS 能选中，
+ * 也让真机检查（test/ui-check.mjs）能直接量出来，不必猜。
+ */
+function markDrawer(which) {
+  if (typeof document === 'undefined') return;
+  const el = document.documentElement;
+  if (which) el.dataset.drawer = which;
+  else delete el.dataset.drawer;
+}
+
+/** 手机上的两个抽屉互斥：开一个就把另一个收起来（否则遮罩会叠在一起） */
 export function openDrawer(section) {
-  patch({ drawer: { open: true, section: section ?? state.drawer.section } });
+  patch({
+    drawer: { open: true, section: section ?? state.drawer.section },
+    sidebarOpen: false,
+  });
+  markDrawer('settings');
+  scrollDrawerNavTo(section);
 }
 export function closeDrawer() {
   patch({ drawer: { ...state.drawer, open: false } });
+  markDrawer(null);
 }
 export function setDrawerSection(section) {
   patch({ drawer: { open: true, section } });
+  markDrawer('settings');
+  scrollDrawerNavTo(section);
+}
+
+/**
+ * 打开设置时把选中的板块页签滚进可视区（手机那排页签是横向滚动的，
+ * 从「模型」进来却停在「插件」那一端会让人以为没切过去）。
+ */
+function scrollDrawerNavTo(section) {
+  if (!section || typeof document === 'undefined') return;
+  requestAnimationFrame(() => {
+    const btn = document.querySelector(`[data-section="${section}"]`);
+    if (btn?.scrollIntoView) btn.scrollIntoView({ block: 'nearest', inline: 'center' });
+  });
 }
 export function openDownloads() {
   patch({ downloads: true });
@@ -451,11 +551,23 @@ export function openDownloads() {
 export function closeDownloads() {
   patch({ downloads: false });
 }
+
+/* 「文件改动」大抽屉：开着时右列那条入口点不开第二次，关掉回到入口条 */
+export function openChanges() {
+  patch({ changesOpen: true });
+}
+export function closeChanges() {
+  patch({ changesOpen: false });
+}
 export function toggleSidebar() {
-  patch({ sidebarOpen: !state.sidebarOpen });
+  const open = !state.sidebarOpen;
+  // 开手机侧栏时把设置抽屉收掉：两个都是 fixed 全高抽屉，同开会让遮罩叠遮罩
+  patch(open ? { sidebarOpen: true, drawer: { ...state.drawer, open: false } } : { sidebarOpen: false });
+  markDrawer(open ? 'sessions' : null);
 }
 export function closeSidebar() {
   patch({ sidebarOpen: false });
+  markDrawer(null);
 }
 export function toggleTodo() {
   const open = !state.todoOpen;
@@ -484,6 +596,9 @@ function ensureStream(sessionId, runId, msgId) {
     calls: [],
     notices: [],
     stats: null,
+    /** 当前 turn / step（服务端 round 事件带的：turn = 用户输入划的段，step = 段内模型调用序号） */
+    turn: 1,
+    step: 0,
     steers: [],
     ended: false,
   };
@@ -543,6 +658,8 @@ export function applyEvent(ev) {
     case 'round':
       updateStream(ev, (s) => ({
         ...s,
+        ...(ev.turn ? { turn: ev.turn } : {}),
+        ...(ev.step ? { step: ev.step } : {}),
         stats: {
           in: (s.stats?.in ?? 0) + (ev.stats?.in ?? 0),
           out: (s.stats?.out ?? 0) + (ev.stats?.out ?? 0),
@@ -577,6 +694,11 @@ export function applyEvent(ev) {
     case 'todo':
       if (sid === state.activeId) patch({ todo: ev.items ? { sessionId: sid, items: ev.items, updated: Date.now() } : null });
       return;
+    /* 文件改动：工具动手前后会广播一条检查点（打快照 / 撤回）。
+       清单本身有界（一次工具调用最多几十个文件），直接重拉整份最省心，也不必在前端做归并。 */
+    case 'checkpoint':
+      void refreshChanges(sid);
+      return;
     case 'run_end': {
       if (state.streams[sid] && state.streams[sid].runId !== ev.runId) return; // 子运行的收尾
       const runs = { ...state.runs };
@@ -588,6 +710,7 @@ export function applyEvent(ev) {
       if (sid === state.activeId) {
         void loadActive(sid); // 用服务端落盘结果整份对齐（停止/出错也走这里）
         void refreshTodo(sid);
+        void refreshChanges(sid);
       }
       void refreshSessions();
       return;

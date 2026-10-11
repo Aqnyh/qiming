@@ -1,6 +1,23 @@
-# 运行数据（会话、运行日志、检查点）不入库：体积大、且是每台机器自己的状态
+# 运行数据（会话 / 项目 / 记忆 / 运行日志 / 检查点 / 待下载）不入库：
+# 体积大，而且是每台机器自己的状态。删掉即回到出厂状态。
 data/
+
+# 依赖与前端构建产物（public/ 只入库 index.html，bundle 由 npm run build:ui 生成）
 node_modules/
 public/app.js
 public/app.css
+
+# Python 运行环境：browser-use 等资源自带的 venv 与字节码
+resources/**/.venv/
+**/__pycache__/
+*.pyc
+
+# 日志与本机下载的临时产物
 *.log
+out/
+tools/proxy-out/
+
+# 本机专属配置：仓库里放 *.example.* 示例，真实配置各人自己写
+.env
+.env.*
+resources/browser-use/config.json

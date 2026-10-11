@@ -60,12 +60,12 @@ before(async () => {
 /* ────────────────────────── 用例 ────────────────────────── */
 
 test('消息分段：附件按 contentAt 插到正文的对应位置（模型发出的顺序）', async () => {
-  const { buildParts } = await import('../ui/lib/message-parts.js');
+  const { buildParts, visibleMessages } = await import('../ui/lib/message-parts.js');
   const media = (id) => ({ seq: id, media: [{ kind: 'image', url: `https://x/${id}.png` }] });
 
   // 没有附件的调用不参与切段（它们只在折叠的追踪条里）
   const plain = buildParts('只有正文', [{ seq: 1, name: 'read_file' }]);
-  assert.deepEqual(plain, [{ text: '只有正文', calls: [], steers: [] }]);
+  assert.deepEqual(plain, [{ text: '只有正文', calls: [] }]);
 
   // "先说一句 → 发图 → 再说一句 → 再发视频"：两段正文各带自己的卡
   const text = '先看这张图。再看这段视频。';
@@ -85,48 +85,83 @@ test('消息分段：附件按 contentAt 插到正文的对应位置（模型发
   assert.equal(legacy[0].calls[0].seq, 9, '卡片挂在"这段正文之后"');
   assert.equal(legacy[1].calls.length, 0);
 
-  /* 插话（立即执行）按 steerAt 切段：它必须夹在正文中间，不能堆到消息末尾。
-     用户报的就是"插话跑到最下面、所有模型输出都在它上面"。 */
-  const t2 = '第一段话。第二段话。';
-  const steered = buildParts(
-    t2,
-    [{ seq: 1, contentAt: t2.length, media: [{ kind: 'image', url: 'https://x/3.png' }] }],
-    [{ id: 's1', content: '插话', steer: true, steerAt: '第一段话。'.length }],
-  );
-  assert.deepEqual(steered.map((p) => p.text), ['第一段话。', '第二段话。', '']);
-  assert.equal(steered[0].steers[0].id, 's1', '插话落在"第一段话"之后 —— 正是它被打断的位置');
-  assert.equal(steered[0].calls.length, 0);
-  assert.equal(steered[1].calls[0].seq, 1, '同一位置的卡片排在插话之后（先看到自己插的话，再看到产出）');
-  assert.equal(steered[2].text, '');
-
-  /* 老插话没有 steerAt：按"放在开头"处理（等价于打断后重开一段），也不能丢 */
-  const legacySteer = buildParts('正文', [], [{ id: 's2', content: '旧插话', steer: true }]);
-  assert.equal(legacySteer[0].steers[0].id, 's2');
-
-  /* groupSteers：插话归到它插进的那条助手消息上（不靠数组里谁挨着谁） */
-  const { groupSteers } = await import('../ui/lib/message-parts.js');
-  const msgs = [
+  /* 插话**不进消息区**（用户明确要求）：它由循环注入的浅文字提示呈现（助手消息的 notices）。
+     这条用例守住"插话永远不出现在消息区"这个约定 —— 它曾经被拼成气泡，
+     还一度被按位置插进正文中间（那正是"顺序看起来不对"的根源）。 */
+  const mixed = [
     { id: 'u1', role: 'user', content: '问题' },
     { id: 'a1', role: 'assistant', content: '答一' },
-    { id: 's1', role: 'user', content: '插话', steer: true, steerInto: 'a1', steerAt: 0 },
+    { id: 's1', role: 'user', content: '插话', steer: true },
     { id: 'a2', role: 'assistant', content: '答二' },
-    { id: 's0', role: 'user', content: '更早的插话', steer: true }, // 老数据：靠"后面那条助手"兜底
-    { id: 'a3', role: 'assistant', content: '答三' },
   ];
-  const g = groupSteers(msgs);
-  assert.deepEqual([...g.byHost.keys()].sort(), ['a1', 'a3']);
-  assert.equal(g.byHost.get('a1')[0].id, 's1');
-  assert.equal(g.byHost.get('a3')[0].id, 's0', '没有 steerInto 时，归给后面那条助手消息');
-  assert.deepEqual(g.rest.map((m) => m.id), ['u1', 'a1', 'a2', 'a3']);
-  assert.equal(g.orphans.length, 0);
-
-  // 完全无从归属的插话不能丢：落进 orphans，界面照样显示
-  const orphan = groupSteers([{ id: 's9', role: 'user', content: '孤儿', steer: true }]);
-  assert.deepEqual(orphan.orphans.map((m) => m.id), ['s9']);
+  assert.deepEqual(visibleMessages(mixed).map((m) => m.id), ['u1', 'a1', 'a2'], '插话被滤掉，其余顺序不变');
+  assert.deepEqual(visibleMessages(null), []);
+  // 插话仍完整留在会话数据里（模型看得到、审计追得到），只是不渲染
+  assert.equal(mixed.filter((m) => m.steer).length, 1);
 
   // 越界/负数要夹到合法范围，不能切飞
   const clamped = buildParts('abc', [{ seq: 1, contentAt: 999, media: [{}] }, { seq: 2, contentAt: -5, media: [{}] }]);
   assert.deepEqual(clamped.map((p) => p.text), ['', 'abc', '']);
+});
+
+test('diff 行装配：折叠只留头尾、并排按块配对、展开按 from 摊平', async () => {
+  const { unifiedRows, splitRows, splitRowsWithFolds, CONTEXT } = await import('../ui/lib/diff-rows.js');
+  assert.equal(CONTEXT, 3, '折叠保留行数写死在协议里（与 git --unified=3 对齐）');
+
+  const ctx = (n, from = 1) => Array.from({ length: n }, (_, i) => ({ oldNo: from + i, newNo: from + i, kind: 'ctx', text: `第${from + i}行` }));
+  const add = (t) => ({ oldNo: null, newNo: null, kind: 'add', text: t });
+  const del = (t) => ({ oldNo: null, newNo: null, kind: 'del', text: t });
+
+  /* 中间一段长上下文：折起来，头尾各留 3 行（GitHub 那个「展开 N 行」条） */
+  const mid = unifiedRows([...ctx(2, 1), add('新'), ...ctx(10, 10)]);
+  const fold = mid.find((r) => r.type === 'fold');
+  assert.ok(fold, '中间的长上下文要折起来');
+  assert.equal(fold.count, 10 - CONTEXT, '折叠数 = 该段总长 − 保留的头尾');
+  assert.equal(mid.filter((r) => r.type === 'line' && r.line.kind === 'ctx').length, 2 + CONTEXT, '头尾保留数正确');
+
+  /* 首尾的上下文段：**靠文件那头不留行**（上面/下面没有内容，留了也只是白占地方），
+     但**照样要折** —— 它挨着改动的那一侧仍然可以展开。 */
+  const edges = unifiedRows([...ctx(8, 1), add('x'), ...ctx(8, 20)]);
+  const folds = edges.filter((r) => r.type === 'fold');
+  assert.equal(folds.length, 2, '开头与结尾的上下文段各自成条');
+  assert.equal(folds[0].count, 8 - CONTEXT, '开头段只留尾 3 行（上面没内容，不留头）');
+  assert.equal(folds[1].count, 8 - CONTEXT, '结尾段只留头 3 行（下面没内容，不留尾）');
+  assert.equal(edges.filter((r) => r.type === 'line').length, 1 + CONTEXT * 2, '加上那 1 行改动');
+
+  /* expandAll：一条折叠都不产生 */
+  assert.equal(unifiedRows([...ctx(2, 1), add('新'), ...ctx(10, 10)], { expandAll: true }).length, 13);
+
+  /* 并排：删 3 加 2 是**同一处改动**，配成 3 行（落单的左边留 null），不是错开成 5 行 */
+  const pairs = splitRows([del('a'), del('b'), del('c'), add('A'), add('B')]);
+  assert.equal(pairs.length, 3, '按块配对，不是按索引');
+  assert.deepEqual(pairs.map((p) => p.left?.text ?? null), ['a', 'b', 'c']);
+  assert.deepEqual(pairs.map((p) => p.right?.text ?? null), ['A', 'B', null]);
+
+  /* 上下文行两边共用同一条（同一个对象，渲染时左右各画一次） */
+  const withCtx = splitRows([...ctx(1, 1), add('z')]);
+  assert.equal(withCtx[0].left, withCtx[0].right, '上下文行左右是同一行');
+
+  /* 并排 + 折叠：折叠条出现在与统一视图**相同的位置**；opened 里的段就地摊平 */
+  const lines = [...ctx(2, 1), add('新'), ...ctx(10, 10)];
+  const sf = splitRowsWithFolds(lines);
+  assert.equal(sf.filter((r) => r.fold).length, 1, '并排视图也要有折叠条');
+  const f0 = sf.find((r) => r.fold).fold;
+  assert.equal(f0.to - f0.from, f0.count, 'from/to 圈住的就是被藏起来的那段（展开时正好补 count 行）');
+  const opened = splitRowsWithFolds(lines, { opened: new Set([f0.from]) });
+  assert.equal(opened.filter((r) => r.fold).length, 0, '展开过的段不再折叠');
+  assert.equal(opened.length, lines.length, '摊平后行数与原文一致（不多不少，不重复头尾）');
+
+  /* 统一视图的展开同理：补上的行数必须等于按钮上写的 count */
+  const uni = unifiedRows(lines);
+  const uf = uni.find((r) => r.type === 'fold');
+  const expanded = [...uni.filter((r) => r.type === 'line').map((r) => r.line), ...lines.slice(uf.from, uf.to)];
+  assert.equal(lines.slice(uf.from, uf.to).length, uf.count, '展开补的行数 = count');
+  assert.deepEqual(expanded, lines, '展开后应还原成完整的逐行序列');
+
+  /* 空输入不能炸（服务端返回空 diff 是常态） */
+  assert.deepEqual(unifiedRows([]), []);
+  assert.deepEqual(splitRows(null), []);
+  assert.deepEqual(splitRowsWithFolds(undefined), []);
 });
 
 test('发送消息：SSE 的 msg 事件先到时，不会重复插一条本地乐观消息', async () => {
