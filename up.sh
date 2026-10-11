@@ -31,7 +31,16 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null || echo 0)" 2>/dev
   exit 0
 fi
 
-# 前端没构建过就先构建（首次运行）
+# 首次运行：先装依赖（node_modules 不入库），再构建前端
+# 顺序不能反 —— 构建前端要用到 esbuild/tailwind，它们都在 devDependencies 里。
+if [ ! -d "$ROOT/node_modules" ]; then
+  echo "== 首次运行：安装依赖 =="
+  if [ -f "$ROOT/package-lock.json" ]; then
+    npm ci || npm install
+  else
+    npm install
+  fi
+fi
 if [ ! -f "$ROOT/public/app.js" ]; then
   echo "== 首次运行：构建前端 =="
   npm run build:ui
